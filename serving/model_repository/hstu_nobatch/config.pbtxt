@@ -1,0 +1,20 @@
+name: "hstu_nobatch"
+backend: "python"
+max_batch_size: 128
+
+input [
+  { name: "item_ids"   data_type: TYPE_INT64 dims: [ -1 ] allow_ragged_batch: true },
+  { name: "timestamps" data_type: TYPE_INT64 dims: [ -1 ] allow_ragged_batch: true }
+]
+output [
+  { name: "top_items"     data_type: TYPE_INT64 dims: [ 10 ] },
+  { name: "top_movie_ids" data_type: TYPE_INT64 dims: [ 10 ] },
+  { name: "top_scores"    data_type: TYPE_FP32  dims: [ 10 ] },
+  { name: "batch_size"    data_type: TYPE_INT32 dims: [ 1 ] }
+]
+
+# Same model with no dynamic_batching block: every request runs alone.
+instance_group [ { kind: KIND_GPU count: 1 gpus: [ 0 ] } ]
+
+parameters { key: "top_k" value: { string_value: "10" } }
+parameters { key: "impl"  value: { string_value: "triton" } }

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1720">
+  <meta name="description" content="Hands-on course: GPU kernels in Triton, Gluon and CUDA, fused into an HSTU recommender, trained on MovieLens and served with Triton Inference Server.">
+  <title>GPU Kernels → HSTU</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <button id="menuBtn" class="icon-btn only-narrow" aria-label="Lessons">☰</button>
+    <div class="brand">GPU Kernels <span class="arrow">→</span> HSTU</div>
+    <nav class="tabs" role="tablist">
+      <button data-view="lessons" role="tab">Lessons</button>
+      <button data-view="cards" role="tab">Cards</button>
+      <button data-view="progress" role="tab">Progress</button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="card-controls" hidden>
+      <div class="seg" id="cardMode">
+        <button data-mode="learn">Learn</button>
+        <button data-mode="test">Test</button>
+      </div>
+      <select id="cardFilter" aria-label="Which cards">
+        <option value="all">All cards</option>
+        <option value="unknown">Not yet known</option>
+        <option value="review">Review only</option>
+      </select>
+      <label class="check"><input type="checkbox" id="shuffle"> Shuffle</label>
+      <button id="restart" class="btn">Restart</button>
+    </div>
+    <button id="printBtn" class="icon-btn" title="Print or save as PDF (⌘P)" aria-label="Print">⎙</button>
+    <div class="menu">
+      <button id="moreBtn" class="icon-btn" aria-label="More">⋮</button>
+      <div id="moreMenu" class="menu-pop" hidden>
+        <button id="exportBtn">Export progress…</button>
+        <button id="importBtn">Import progress…</button>
+        <button id="resetBtn">Reset progress…</button>
+        <hr>
+        <a href="https://github.com/venkatacrc/gpukernels" target="_blank" rel="noopener">Repository</a>
+        <button id="helpBtn">Keyboard shortcuts</button>
+      </div>
+      <input type="file" id="importFile" accept="application/json" hidden>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside id="sidebar" class="sidebar">
+      <div class="side-head">
+        <span>Lessons</span>
+        <span class="side-actions">
+          <button id="selAll" class="link">Select all</button> ·
+          <button id="selNone" class="link">Clear</button>
+        </span>
+      </div>
+      <ol id="lessonList" class="lesson-list"></ol>
+      <div class="side-foot" id="sideFoot"></div>
+    </aside>
+    <main id="main" class="main" tabindex="-1"></main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="helpDlg">
+    <h3>Keyboard shortcuts</h3>
+    <table>
+      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>previous / next lesson or card</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Test: show the answer</td></tr>
+      <tr><td><kbd>G</kbd> / <kbd>M</kbd></td><td>Test: got it / missed it</td></tr>
+      <tr><td><kbd>K</kbd> / <kbd>R</kbd></td><td>mark card known / for review</td></tr>
+      <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Lessons / Cards / Progress</td></tr>
+      <tr><td><kbd>⌘P</kbd></td><td>print the current lesson or the selected lessons</td></tr>
+    </table>
+    <form method="dialog"><button class="btn">Close</button></form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1308 @@
+{
+ "title": "GPU Kernels to HSTU: a hands-on course",
+ "built": "2026-10-28",
+ "lessons": [
+  {
+   "id": "00",
+   "title": "Setup and the GPU mental model",
+   "summary": "check the toolchain, measure the two roofs every later lab is judged against",
+   "minutes": 30,
+   "lab": "",
+   "track": "foundations",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<h3>How this course works</h3>\n<p>Every lab follows the same loop, and the app follows it too:</p>\n<ol><li><strong>Write</strong>: open <code>labs/NN_name/kernel.py</code> and fill in the numbered <code>TODO</code>s. <code>solution.py</code> next to it is the reference; peek only when stuck.</li><li><strong>Run</strong>: <code>python labs/NN_name/run.py</code> checks your kernel against PyTorch, then benchmarks it. <code>--solution</code> runs the reference instead.</li><li><strong>Measure</strong>: type the numbers your GPU printed into the lesson. The app shows the reference from the course GB200 next to yours.</li><li><strong>Explain</strong>: the explanation unlocks once you have measured. Predict first, then read why.</li></ol>\n<p>Every <code>run.py</code> ends with four lines: <code>CLAIM</code> (what the lesson asserts), <code>MEASURED</code>, <code>VERDICT</code> and <code>NEXT</code>. When a claim fails on your hardware, that is a finding, not a bug in your reading.</p>\n<p>The path through the course:</p>\n<table><thead><tr><th>Part</th><th>Labs</th><th>You build</th></tr></thead><tbody><tr><td>Kernels</td><td>01–05</td><td>vector add (Triton, Gluon, CUDA), fused softmax, LayerNorm·mul, GEMM+SiLU with TMA, CUDA reductions</td></tr><tr><td>HSTU</td><td>06–08</td><td>jagged attention forward, backward, then the full model</td></tr><tr><td>Train</td><td>09</td><td>HSTU on MovieLens-1M</td></tr><tr><td>Serve</td><td>10</td><td>Triton Inference Server with dynamic batching</td></tr><tr><td>Systems</td><td>11</td><td>profiling, batch scaling, CUDA graphs, compile caches</td></tr><tr><td>Field notes</td><td>12</td><td>what the 2026 Triton conference added</td></tr></tbody></table>\n<h3>A GPU in five sentences</h3>\n<p>A GPU is a grid of <strong>streaming multiprocessors</strong> (SMs; 152 on GB200). Each SM runs groups of 32 threads called <strong>warps</strong> in lockstep, and keeps many warps resident so that while one waits on memory another computes. Data moves through a hierarchy: registers (per thread) → shared memory (per block, up to 227 KB) → L2 (shared, 129 MiB) → HBM. A kernel launch is a grid of <strong>blocks</strong> (Triton calls them <strong>programs</strong>); every block runs on one SM. Performance is almost always about keeping enough bytes in flight to cover HBM latency, or enough math in flight to keep the tensor cores busy.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Nothing to write yet. Create the environment once:</p>\n<pre><code class=\"lang-bash\">python -m venv venv &amp;&amp; source venv/bin/activate\npython -m pip install torch triton numpy\ngit clone https://github.com/venkatacrc/gpukernels &amp;&amp; cd gpukernels</code></pre>\n<p>The CUDA labs compile with NVRTC through <code>torch.cuda._compile_kernel</code>, so no <code>nvcc</code> is needed; <code>gk/bench.py</code> finds the CUDA headers that ship inside the torch wheel.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python tools/check_env.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "copy_bw",
+       "label": "HBM copy bandwidth",
+       "ref": 6637.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "mm_tf",
+       "label": "bf16 matmul 8192³",
+       "ref": 1741.0,
+       "unit": "TFLOP/s"
+      },
+      {
+       "key": "launch",
+       "label": "smallest kernel as timed",
+       "ref": 6.9,
+       "unit": "µs"
+      },
+      {
+       "key": "sms",
+       "label": "number of SMs",
+       "ref": 152.0,
+       "unit": "SMs"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Two roofs.</strong> The copy reads 1 GiB and writes 1 GiB, so it reports achievable HBM bandwidth (GB200 HBM3e is rated near 8 TB/s; reaching about 85% with a plain copy is normal). The 8192³ matmul does <span class=\"math\">2 · 8192<sup>3</sup></span> FLOPs and is bound by the tensor cores.</p>\n<p><strong>Arithmetic intensity.</strong> Divide the two: 1741 TFLOP/s ÷ 6.6 TB/s ≈ 262 FLOPs per byte. That is the <em>ridge point</em> of the roofline. A vector add does 1 FLOP per 12 bytes, far below the ridge, so labs 01–03 and 05 are judged in GB/s. A large GEMM does hundreds of FLOPs per byte, so Lab 04 is judged in TFLOP/s. Attention (labs 06–07) sits in between, and the whole game there is not writing the <span class=\"math\">N<sup>2</sup></span> matrix to memory.</p>\n<p><strong>The launch floor.</strong> Even a 1-element kernel costs several microseconds end to end. A model step that launches 300 small kernels pays that floor 300 times. Remember this number for Lab 11.</p>"
+    }
+   ]
+  },
+  {
+   "id": "01",
+   "title": "Vector add three ways",
+   "summary": "the same kernel in Triton, Gluon and CUDA; masks, layouts, vector loads, Little's law",
+   "minutes": 60,
+   "lab": "labs/01_vector_add",
+   "track": "kernels",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>The simplest kernel there is: <code>out = x + y</code>. You will write it three times, at three levels of control:</p>\n<ul><li><strong>Triton</strong>: you describe what one <em>program</em> does with a whole block of elements; the compiler decides how threads split it.</li><li><strong>Gluon</strong>: Triton's lower-level dialect. Same language, but <em>you</em> choose the layout: which thread owns which elements.</li><li><strong>CUDA</strong>: you write what one <em>thread</em> does. Everything else is your job.</li></ul>\n<p>Vector add is purely memory-bound (12 bytes moved per FLOP), so the only score is GB/s, against the copy bandwidth you measured in lesson 00.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Open <code>labs/01_vector_add/kernel.py</code>.</p>\n<p><strong>Triton (TODOs 1–4).</strong> Each program owns <code>BLOCK</code> consecutive elements:</p>\n<pre><code class=\"lang-python\">pid = tl.program_id(0)\noffs = pid * BLOCK + tl.arange(0, BLOCK)\nmask = offs &lt; n                       # the last block runs past the end\nx = tl.load(x_ptr + offs, mask=mask)\ny = tl.load(y_ptr + offs, mask=mask)\ntl.store(out_ptr + offs, x + y, mask=mask)</code></pre>\n<p>Launch with <code>grid = (triton.cdiv(n, BLOCK),)</code>.</p>\n<p><strong>Gluon (TODOs 5–6).</strong> The body is identical except <code>gl.arange</code> needs an explicit layout. Build it in the wrapper:</p>\n<pre><code class=\"lang-python\">layout = gl.BlockedLayout(size_per_thread=[vec], threads_per_warp=[32],\n                          warps_per_cta=[num_warps], order=[0])</code></pre>\n<p><code>size_per_thread=[4]</code> means each thread owns 4 <em>consecutive</em> fp32 values, which the compiler can fetch with one 16-byte load. If <code>BLOCK</code> is larger than <code>vec · 32 · num_warps</code>, the layout repeats and each thread owns several such chunks.</p>\n<p><strong>CUDA (TODOs 7–9).</strong> A scalar kernel (one float per thread) and a <code>float4</code> kernel (16 bytes per thread):</p>\n<pre><code class=\"lang-cpp\">int i = blockIdx.x * blockDim.x + threadIdx.x;\nif (i &lt; n4) { float4 a = x[i], b = y[i]; out[i] = make_float4(a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w); }</code></pre>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/01_vector_add/run.py           # your kernel.py\npython labs/01_vector_add/run.py --solution</code></pre>\n<p>The table sweeps sizes from 2¹⁶ to 2²⁸ elements and a Gluon <code>vec</code> sweep.</p>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "torch_big",
+       "label": "torch add, 2²⁸ elements",
+       "ref": 7142.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "triton_big",
+       "label": "Triton add, 2²⁸",
+       "ref": 7149.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "gluon_big",
+       "label": "Gluon add, 2²⁸",
+       "ref": 7142.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "cuda_scalar",
+       "label": "CUDA scalar, 2²⁸",
+       "ref": 4075.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "cuda_f4",
+       "label": "CUDA float4, 2²⁸",
+       "ref": 7215.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "small_us",
+       "label": "any kernel at 2¹⁶ elements",
+       "ref": 6.6,
+       "unit": "µs"
+      },
+      {
+       "key": "gluon_vec1",
+       "label": "Gluon vec=1, 2²⁸",
+       "ref": 7208.0,
+       "unit": "GB/s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Everyone hits the same wall except scalar CUDA.</strong> Torch, Triton, Gluon and float4 CUDA all land near 7.1–7.2 TB/s, above the 6.6 TB/s copy because a copy moves 2 bytes per byte read while add moves 3, and more concurrent streams keep HBM busier. Scalar CUDA tops out near 4.1 TB/s.</p>\n<p><strong>Little's law explains why.</strong> To sustain bandwidth <span class=\"math\">B</span> against memory latency <span class=\"math\">L</span>, you need <span class=\"math\">B × L</span> bytes in flight. At roughly 7 TB/s and roughly 1 µs that is several MB across the chip, tens of KB per SM. A scalar CUDA thread issues one 4-byte load per input and then waits. Even with the SM full of threads, there aren't enough bytes outstanding. The float4 version puts 16 bytes per load in flight, four times more per instruction.</p>\n<p><strong>Then why is Gluon vec=1 still fast?</strong> Because the layout <em>repeats</em>. With <code>BLOCK=4096</code>, 4 warps and vec=1, each thread owns 4096 / 128 = 32 elements and issues 32 independent loads before waiting. Width per load matters less than <em>total</em> bytes in flight per thread. The vec sweep (7208 / 7174 / 7133 / 7134 GB/s for vec 1/2/4/8) shows it: once enough loads are outstanding, the width barely matters. Triton's default layout makes this choice for you; Gluon lets you see and change it.</p>\n<p><strong>Small sizes measure launch, not bandwidth.</strong> At 2¹⁶ elements (768 KB) every implementation takes about 6.6 µs, the launch-and-sync floor from lesson 00. The data sits in L2 anyway. Never quote GB/s for a kernel that runs in under about 10 µs.</p>\n<p><strong>The mask.</strong> Without <code>mask=offs &lt; n</code> the last program reads and writes past the end of the buffer. On a GPU that is silent memory corruption, or an illegal-address fault if you are lucky.</p>"
+    }
+   ]
+  },
+  {
+   "id": "02",
+   "title": "Fused softmax",
+   "summary": "kernel fusion = fewer HBM round trips; one row per program, stable max, register limits",
+   "minutes": 45,
+   "lab": "labs/02_fused_softmax",
+   "track": "kernels",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Softmax along a row: <span class=\"math\">y<sub>i</sub> = e<sup>x<sub>i</sub> - m</sup> / Σ<sub>j</sub> e<sup>x<sub>j</sub> - m</sup></span> with <span class=\"math\">m = max<sub>j</sub> x<sub>j</sub></span>.</p>\n<p>Written in PyTorch as separate ops (<code>max</code>, <code>sub</code>, <code>exp</code>, <code>sum</code>, <code>div</code>), every step reads the full matrix from HBM and writes a temporary back. That is about five reads and three writes per element. A <strong>fused</strong> kernel loads each row once into registers, does all of it there, and writes once: one read, one write.</p>\n<p>That is the entire idea of kernel fusion: count HBM round trips and remove them.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/02_fused_softmax/kernel.py</code>, TODOs 1–5. One program per row:</p>\n<pre><code class=\"lang-python\">row = tl.program_id(0)\ncols = tl.arange(0, BLOCK)\nmask = cols &lt; n_cols\nx = tl.load(x_ptr + row * stride + cols, mask=mask, other=-float(&quot;inf&quot;))\nx = x - tl.max(x, axis=0)\nnum = tl.exp(x)\nout = num / tl.sum(num, axis=0)\ntl.store(out_ptr + row * stride + cols, out.to(out_ptr.dtype.element_ty), mask=mask)</code></pre>\n<p><code>other=-inf</code> matters: padded lanes must not win the max, and <code>exp(-inf) = 0</code> keeps them out of the sum. <code>BLOCK = triton.next_power_of_2(n_cols)</code>; bump <code>num_warps</code> as rows grow so each thread holds fewer elements.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/02_fused_softmax/run.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "naive_us",
+       "label": "naive (5 PyTorch ops), 16384×4096",
+       "ref": 558.0,
+       "unit": "µs"
+      },
+      {
+       "key": "torch_us",
+       "label": "torch.softmax, 16384×4096",
+       "ref": 182.0,
+       "unit": "µs"
+      },
+      {
+       "key": "triton_us",
+       "label": "your Triton, 16384×4096",
+       "ref": 82.0,
+       "unit": "µs"
+      },
+      {
+       "key": "triton_16k",
+       "label": "Triton at 16384 columns",
+       "ref": 7038.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "torch_16k",
+       "label": "torch.softmax at 16384 columns",
+       "ref": 4406.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "triton_64k",
+       "label": "Triton at 65536 columns",
+       "ref": 3951.0,
+       "unit": "GB/s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Naive vs fused: 6.8×.</strong> The 16384×4096 fp32 matrix is 256 MiB. The naive version moves about 8 × 256 MiB; the fused one moves 2 × 256 MiB. Time ratio 558 / 82 ≈ 6.8, which is the round-trip ratio plus the saved launches.</p>\n<p><strong>Fused vs torch.softmax: 2.2×.</strong> PyTorch's softmax is already one fused kernel, so why is ours faster at this shape? Its generic kernel makes more than one pass over the row (max pass, then sum-and-write) and is tuned for a wide range of shapes. Ours holds the entire row in registers and reads it once. At 16384 columns we reach 7.0 TB/s, essentially HBM speed, vs 4.4 TB/s for torch.</p>\n<p><strong>Where it breaks: 65536 columns.</strong> A 64K-column fp32 row is 256 KB. With 32 warps that is 64 values per thread, more than the register file can hold alongside everything else, so the compiler <strong>spills</strong> to local memory, which really is HBM. Bandwidth drops to 3.95 TB/s and torch catches up (3.7 TB/s). The fix for very long rows is the <em>online softmax</em>: loop over chunks keeping a running max and a rescaled running sum. That is exactly the trick flash attention uses, and you will use its relative in Lab 06.</p>\n<p><strong>Numerical safety.</strong> Subtracting the row max keeps <code>exp</code> from overflowing in fp32 (it overflows above about 88) without changing the result, because the factor <span class=\"math\">e<sup>-m</sup></span> cancels.</p>"
+    }
+   ]
+  },
+  {
+   "id": "03",
+   "title": "LayerNorm × gate, forward and backward",
+   "summary": "fuse a normalisation with HSTU's gating multiply; save mean/rstd; write the backward",
+   "minutes": 60,
+   "lab": "labs/03_layernorm_mul",
+   "track": "kernels",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>HSTU's output path computes <code>y = LayerNorm(attn) * u</code>, where <code>u</code> is a gate projected from the input. In PyTorch that is a LayerNorm kernel, which writes its output to HBM, and then a multiply kernel that reads it back. Fusing them saves one full read and write of the activation. It is also the first kernel in the course with a <strong>backward</strong>, so the forward must save what the backward needs.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/03_layernorm_mul/kernel.py</code>.</p>\n<p><strong>Forward (TODOs 1–6), one row per program:</strong></p>\n<pre><code class=\"lang-python\">x = tl.load(x_ptr + row * D + cols, mask=mask, other=0.0).to(tl.float32)\nmean = tl.sum(x, axis=0) / D\nxc = tl.where(mask, x - mean, 0.0)\nvar = tl.sum(xc * xc, axis=0) / D\nrstd = 1.0 / tl.sqrt(var + eps)\ny = (xc * rstd * w + b) * u\ntl.store(mean_ptr + row, mean); tl.store(rstd_ptr + row, rstd)</code></pre>\n<p>Accumulate in fp32 even when inputs are bf16.</p>\n<p><strong>Backward (TODO 7)</strong>, written in PyTorch inside the <code>autograd.Function</code>, using the saved mean and rstd. With <span class=\"math\">x̂ = (x-μ) r</span>, <span class=\"math\">ℓ = x̂ w + b</span> and <span class=\"math\">y = ℓ u</span>:</p>\n<ul><li><span class=\"math\">∂ u = g · ℓ</span></li><li><span class=\"math\">g<sub>ℓ</sub> = g · u</span>, so <span class=\"math\">∂ w = Σ<sub>rows</sub> g<sub>ℓ</sub> x̂</span> and <span class=\"math\">∂ b = Σ<sub>rows</sub> g<sub>ℓ</sub></span></li><li><span class=\"math\">g<sub>x̂</sub> = g<sub>ℓ</sub> w</span>, then <span class=\"math\">∂ x = r (g<sub>x̂</sub> - <span class=\"ovl\">g<sub>x̂</sub></span> - x̂ <span class=\"ovl\">g<sub>x̂</sub> x̂</span>)</span>, where the overline is the mean over the row.</li></ul>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/03_layernorm_mul/run.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "speed_min",
+       "label": "smallest fused speedup in the table",
+       "ref": 2.09,
+       "unit": "×"
+      },
+      {
+       "key": "speed_max",
+       "label": "largest fused speedup",
+       "ref": 2.57,
+       "unit": "×"
+      },
+      {
+       "key": "bf16_bw",
+       "label": "bf16, 262144×512",
+       "ref": 3737.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "fp32_bw",
+       "label": "fp32, 262144×512",
+       "ref": 6086.0,
+       "unit": "GB/s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Why about 2×+.</strong> Unfused: LayerNorm reads x and writes ℓ; the multiply reads ℓ and u and writes y. That is 5 activation-sized transfers. Fused: read x and u, write y, so 3 transfers, plus 8 bytes per row for mean and rstd. 5/3 ≈ 1.7× from bytes alone. The measured 2.1–2.6× is higher because PyTorch's LayerNorm also does a separate pass to compute statistics, and we save a launch.</p>\n<p><strong>bf16 is slower in GB/s, not in time.</strong> The same shape in bf16 moves half the bytes, but the kernel still does the same number of reductions and the same per-row work with half as many bytes to hide them behind. With D=512, a row is only 1 KB in bf16; each program is short and spends proportionally more time in the two tree reductions and the launch tail. The lesson: for narrow rows, put several rows in one program (a 2-D block) so each program moves more bytes.</p>\n<p><strong>Save statistics, not activations.</strong> Saving mean and rstd costs 8 bytes per row; saving ℓ would cost D·2 bytes per row. The backward recomputes <span class=\"math\">x̂</span> from x and the stats. This <em>recompute instead of store</em> trade comes back in Lab 07 (attention backward) and Lab 08 (GEMM+SiLU backward).</p>\n<p><strong>Why the dx formula has two mean terms.</strong> Both μ and r depend on every element in the row, so each input's gradient is reduced by the gradient carried through the mean (the <span class=\"math\"><span class=\"ovl\">g<sub>x̂</sub></span></span> term) and through the variance (the <span class=\"math\">x̂ <span class=\"ovl\">g<sub>x̂</sub>x̂</span></span> term).</p>"
+    }
+   ]
+  },
+  {
+   "id": "04",
+   "title": "GEMM + SiLU, from tiles to TMA",
+   "summary": "tiled GEMM, grouped ordering, epilogue fusion, then Blackwell TMA + persistent + warp specialization",
+   "minutes": 90,
+   "lab": "labs/04_matmul_silu",
+   "track": "kernels",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Every HSTU layer starts with one GEMM that produces four projections at once, followed by SiLU: <code>UVQK = SiLU(LN(x) @ W)</code>. The HSTU shape is tall and skinny: M = tokens (tens of thousands), N = 4·d, K = d.</p>\n<p>This lab has two steps:</p>\n<ol><li>A <strong>pointer-based tiled GEMM</strong>, the classic Triton matmul, with the SiLU fused into the epilogue.</li><li>The <strong>Blackwell version</strong>: TMA descriptors move tiles between HBM and shared memory, a persistent grid runs one program per SM, and warp specialization splits producer and consumer warps.</li></ol>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/04_matmul_silu/kernel.py</code>.</p>\n<p><strong>Step 1 (TODOs 1–5).</strong> Each program computes one BM×BN tile of C:</p>\n<pre><code class=\"lang-python\">a_ptrs = a_ptr + offs_m[:, None] * sam + offs_k[None, :] * sak\nb_ptrs = b_ptr + offs_k[:, None] * sbk + offs_n[None, :] * sbn\nacc = tl.zeros((BM, BN), dtype=tl.float32)\nfor k in range(0, tl.cdiv(K, BK)):\n    a = tl.load(a_ptrs, mask=..., other=0.0)\n    b = tl.load(b_ptrs, mask=..., other=0.0)\n    acc = tl.dot(a, b, acc)          # tensor cores, fp32 accumulate\n    a_ptrs += BK * sak; b_ptrs += BK * sbk\nif ACT == &quot;silu&quot;:\n    acc = acc * tl.sigmoid(acc)      # epilogue fusion: free, the tile is in registers</code></pre>\n<p><strong>Grouped ordering (TODO 3).</strong> Map <code>pid</code> so that GROUP consecutive programs walk down a column of M-tiles before moving to the next N-tile. They reuse the same B tiles while those are still in L2.</p>\n<p><strong>Step 2 (TODOs 6–9).</strong> B is passed transposed (N×K) so both operands are K-contiguous:</p>\n<pre><code class=\"lang-python\">a_d = tl.make_tensor_descriptor(a_ptr, shape=[M, K], strides=[K, 1], block_shape=[BM, BK])\nb_d = tl.make_tensor_descriptor(bt_ptr, shape=[N, K], strides=[K, 1], block_shape=[BN, BK])\nfor tile in tl.range(tl.program_id(0), num_m * num_n, NUM_SMS, flatten=True, warp_specialize=True):\n    ...\n    for k in range(k_tiles):\n        acc = tl.dot(a_d.load([pid_m * BM, k * BK]), b_d.load([pid_n * BN, k * BK]).T, acc)\n    acc = acc / (1.0 + tl.exp2(-1.4426950408889634 * acc))     # SiLU via exp2\n    c_d.store([pid_m * BM, pid_n * BN], acc.to(c_ptr.dtype.element_ty))</code></pre>\n<p>Descriptors need scratch memory: call <code>triton.set_allocator(...)</code> once. TMA requires 16-byte-aligned strides, so K and N must be multiples of 8 in bf16.</p>\n<p><strong>Autotune key.</strong> Key on <code>M_BUCKET = triton.next_power_of_2(M)</code>, not M. In training M is the token count of a jagged batch, which changes every step, and keying on raw M re-runs the autotuner every step. That bug made the first version of Lab 09 hang.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/04_matmul_silu/run.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "cublas_tf",
+       "label": "cuBLAS GEMM, 65536×1024×256",
+       "ref": 925.0,
+       "unit": "TFLOP/s"
+      },
+      {
+       "key": "cublas_silu_us",
+       "label": "cuBLAS GEMM, then F.silu",
+       "ref": 95.0,
+       "unit": "µs"
+      },
+      {
+       "key": "step1_tf",
+       "label": "step 1 pointer GEMM",
+       "ref": 453.0,
+       "unit": "TFLOP/s"
+      },
+      {
+       "key": "step2_tf",
+       "label": "step 2 TMA/persistent/WS GEMM",
+       "ref": 763.0,
+       "unit": "TFLOP/s"
+      },
+      {
+       "key": "step2_silu_us",
+       "label": "step 2 GEMM+SiLU fused",
+       "ref": 59.0,
+       "unit": "µs"
+      },
+      {
+       "key": "big_cublas",
+       "label": "cuBLAS at 8192³",
+       "ref": 1778.0,
+       "unit": "TFLOP/s"
+      },
+      {
+       "key": "big_step2",
+       "label": "step 2 at 8192³",
+       "ref": 1567.0,
+       "unit": "TFLOP/s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>The fused epilogue is the win.</strong> For the HSTU shape, cuBLAS does the GEMM in 37 µs, but the separate SiLU reads and writes the 65536×1024 bf16 output (128 MiB each way) and the pair takes 95 µs. Our step-2 kernel does both in about 59 µs: <strong>1.6× faster than cuBLAS + SiLU</strong>, even though our plain GEMM (763 TFLOP/s) is slower than cuBLAS's (925). On a skinny GEMM the epilogue is a large fraction of total bytes, and fusing it beats a better GEMM.</p>\n<p><strong>Why step 1 is slow (453 TFLOP/s).</strong> With pointer loads, the same warps compute addresses, issue loads, wait, and run MMAs. Software pipelining (<code>num_stages</code>) helps, but every warp still spends registers and issue slots on address math and waiting.</p>\n<p><strong>What step 2 changes.</strong></p>\n<ul><li><strong>TMA</strong> (Tensor Memory Accelerator): one thread hands a descriptor and a coordinate to a hardware copy engine, which moves the whole tile into shared memory asynchronously. No per-thread address math, bounds checks done in hardware.</li><li><strong>Persistent grid</strong>: launch exactly 152 programs, one per SM. Each loops over tiles, so the pipeline stays warm across tiles and there is no tail of half-empty waves.</li><li><strong>Warp specialization</strong> (<code>warp_specialize=True</code>): the compiler splits the program into producer warps that only issue TMA loads and consumer warps that only issue MMAs, connected by shared-memory barriers. Loads for tile k+1 overlap MMAs for tile k. An ablation on this machine: the same TMA kernel without WS reached 636 TFLOP/s; with WS, 790.</li><li><strong>EPI=2</strong>: store the output tile in two halves so fewer accumulator registers are live during the store.</li></ul>\n<p>Total: 1.67× over step 1.</p>\n<p><strong>Large square GEMMs.</strong> At 8192³, cuBLAS (1778 TFLOP/s) still leads our 1567. It uses Blackwell's 2-CTA tcgen05 MMAs and hand-tuned tile schedulers. Matching it is a research project; beating it on <em>fused</em> workloads is the practical goal, and you just did.</p>\n<p><strong>The SiLU formula.</strong> <span class=\"math\">x · σ(x) = x / (1 + e<sup>-x</sup>)</span>, and <span class=\"math\">e<sup>-x</sup> = 2<sup>-x log<sub>2</sub> e</sup></span>. <code>exp2</code> maps to a single hardware instruction (MUFU.EX2), while <code>tl.sigmoid</code> may lower to a slower exp plus a full-precision divide.</p>"
+    }
+   ]
+  },
+  {
+   "id": "05",
+   "title": "Reductions in raw CUDA",
+   "summary": "coalescing, shared-memory trees, warp shuffles, float4; compiled at runtime with NVRTC",
+   "minutes": 60,
+   "lab": "labs/05_cuda_reduction",
+   "track": "kernels",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Triton hides two things you must understand to read any kernel profile: <strong>coalescing</strong> (how the 32 threads of a warp turn their addresses into memory transactions) and <strong>intra-block communication</strong> (shared memory and warp shuffles). This lab sums each row of an M×N fp32 matrix three ways in CUDA, then once more in Triton.</p>\n<p>The CUDA source is a Python string compiled at runtime with NVRTC:</p>\n<pre><code class=\"lang-python\">k = torch.cuda._compile_kernel(CUDA_SRC, &quot;rowsum_shfl&quot;)\nk(grid=(m, 1, 1), block=(256, 1, 1), args=[x, out, m, n])</code></pre>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/05_cuda_reduction/kernel.py</code>.</p>\n<p><strong>v1, one thread per row</strong> (given). Each thread loops over its row.</p>\n<p><strong>v2, one block per row with a shared-memory tree (TODOs 1–4):</strong></p>\n<pre><code class=\"lang-cpp\">float s = 0.f;\nfor (int j = threadIdx.x; j &lt; n; j += blockDim.x) s += r[j];     // coalesced: lane i reads r[base + i]\nbuf[threadIdx.x] = s; __syncthreads();\nfor (int stride = blockDim.x / 2; stride &gt; 0; stride &gt;&gt;= 1) {\n    if (threadIdx.x &lt; stride) buf[threadIdx.x] += buf[threadIdx.x + stride];\n    __syncthreads();\n}\nif (threadIdx.x == 0) out[blockIdx.x] = buf[0];</code></pre>\n<p><strong>v3, float4 loads and warp shuffles (TODOs 5–7):</strong></p>\n<pre><code class=\"lang-cpp\">__device__ float warp_sum(float v) {\n    for (int off = 16; off &gt; 0; off &gt;&gt;= 1) v += __shfl_xor_sync(0xffffffff, v, off);\n    return v;\n}</code></pre>\n<p>Each thread accumulates float4s, reduces within its warp by shuffles (no shared memory, no barriers), and lane 0 of each warp writes one partial. Warp 0 then reduces the partials.</p>\n<p><strong>Triton (TODO 8):</strong> loop over the row in BLOCK chunks into a <code>(BLOCK,)</code> fp32 accumulator, then <code>tl.sum</code> once at the end.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/05_cuda_reduction/run.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "v1",
+       "label": "v1 thread-per-row, 16384×8192",
+       "ref": 522.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "v2",
+       "label": "v2 shared-memory tree",
+       "ref": 2362.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "v3",
+       "label": "v3 float4 + shuffles",
+       "ref": 5823.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "triton",
+       "label": "Triton rowsum",
+       "ref": 5533.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "torch",
+       "label": "torch.sum(dim=1)",
+       "ref": 4480.0,
+       "unit": "GB/s"
+      },
+      {
+       "key": "v1_wide",
+       "label": "v1 at 2048×65536",
+       "ref": 30.0,
+       "unit": "GB/s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>v1 (522 GB/s, and 30 GB/s on wide rows): uncoalesced.</strong> At step j, thread t reads <code>x[t·n + j]</code>. The 32 lanes of a warp touch 32 different rows, n·4 bytes apart, so each lane needs its own 32-byte sector: 32 transactions to deliver 128 useful bytes. Only 1/8 of every sector is used. On wide, short matrices (2048 rows) it gets worse: only 2048 threads exist, 64 warps for 152 SMs, so most SMs sit idle: almost no parallelism <em>and</em> no coalescing. 30 GB/s is 0.5% of the hardware.</p>\n<p><strong>v2 (2362 GB/s): coalesced but under-fed.</strong> Lane i reads <code>r[j + i]</code>, so a warp's 32 loads hit 128 contiguous bytes, perfectly coalesced. But each thread keeps only one 4-byte load in flight per loop iteration (lesson 01's Little's law again), and the tree spends log₂(256) = 8 barrier-separated steps, in which most threads sit idle.</p>\n<p><strong>v3 (5823 GB/s): enough bytes in flight, cheap reduction.</strong> float4 quadruples bytes per load. <code>__shfl_xor_sync</code> exchanges registers between lanes of a warp directly: 5 steps, no shared memory, no <code>__syncthreads</code>. Shared memory carries only 8 partials (one per warp). This is how production reductions (CUB, PyTorch) are written.</p>\n<p><strong>Triton (5533 GB/s) gets close with four lines.</strong> The <code>(BLOCK,)</code> accumulator means each thread holds several independent partial sums, which gives instruction-level parallelism and wide loads, and <code>tl.sum</code> lowers to the same shuffle tree. Torch's generic reduction (4480) handles every dtype, layout and dimension, and pays for that generality.</p>\n<p><strong>Takeaway.</strong> When a profile shows low bandwidth, check in this order: are warps coalesced? Are there enough bytes in flight per thread? Is the reduction serialised behind barriers?</p>"
+    }
+   ]
+  },
+  {
+   "id": "06",
+   "title": "HSTU attention forward (jagged, fused)",
+   "summary": "pointwise SiLU attention with a time-and-position bias, over jagged sequences, without ever storing N×N",
+   "minutes": 120,
+   "lab": "labs/06_hstu_attention_fwd",
+   "track": "hstu",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<h3>What HSTU attention computes</h3>\n<p>HSTU (Hierarchical Sequential Transduction Units, Zhai et al., 2024) is the generative recommender architecture behind Meta's trillion-parameter recommendation models. Each user is a sequence of interactions (here: movies, with timestamps). Its attention differs from a transformer's in three ways:</p>\n<ol><li><strong>Pointwise, not softmax.</strong> <span class=\"math\">A = <span class=\"mr\">SiLU</span>(α QK<sup>ᵀ</sup> + <span class=\"mr\">rab</span>) / N</span>. No row normalisation, so no running max or sum, and each score is independent.</li><li><strong>Relative attention bias from position and time.</strong> <span class=\"math\"><span class=\"mr\">rab</span><sub>ij</sub> = w<sub>pos</sub>[<span class=\"mr\">clamp</span>(i-j, 0, P-1)] + w<sub>ts</sub>[⌊ log<sub>2</sub> max(|t<sub>i</sub> - t<sub>j</sub>|, 1) ⌋]</span>. How long ago you watched something matters, on a log scale.</li><li><strong>Jagged batches.</strong> Users have different history lengths. Instead of padding to the longest, sequences are concatenated into one <code>(T, H, D)</code> tensor with <code>offsets[b] .. offsets[b+1]</code> marking user b.</li></ol>\n<p>Causal masking keeps <span class=\"math\">j ≤ i</span>.</p>\n<h3>The fusion</h3>\n<p>A PyTorch implementation pads to <code>(B, H, N, D)</code>, materialises the <code>(B, H, N, N)</code> score matrix, gathers the bias into another N×N tensor, applies SiLU, masks, and multiplies by V. That is several N² tensors in HBM, plus compute wasted on padding.</p>\n<p>The fused kernel gives each program BM query rows of one (user, head). It streams that user's key/value blocks through shared memory, builds scores <em>and</em> bias in registers, and accumulates <span class=\"math\">A V</span> directly. <strong>Nothing N×N ever touches HBM</strong>, and padding never exists.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/06_hstu_attention_fwd/kernel.py</code>.</p>\n<p><strong>The bias helper (TODOs 1–3):</strong></p>\n<pre><code class=\"lang-python\">rel = offs_m[:, None] - offs_n[None, :]\npos_b = tl.minimum(tl.maximum(rel, 0), P - 1)\ndt = tl.maximum(tl.abs(ts_m[:, None] - ts_n[None, :]).to(tl.float32), 1.0)\nt_b = ((dt.to(tl.int32, bitcast=True) &gt;&gt; 23) &amp; 0xFF) - 127      # floor(log2(dt)) from the exponent bits\nt_b = tl.minimum(tl.maximum(t_b, 0), NT - 1)\nbias = tl.load(pos_w_ptr + pos_b) + tl.load(ts_w_ptr + t_b)</code></pre>\n<p><strong>The kernel (TODOs 4–8).</strong> Grid <code>(cdiv(max_len, BM), B * H)</code>. Read <code>start = offsets[b]</code> and <code>L = offsets[b+1] - start</code>; programs with <code>pid_m * BM &gt;= L</code> return immediately (that is how jaggedness costs nothing). Then:</p>\n<pre><code class=\"lang-python\">hi = tl.minimum((pid_m + 1) * BM, L)          # causal: no key beyond this block&#x27;s last query\nfor n0 in range(0, hi, BN):\n    k, v, ts_n = ...                          # masked loads of BN keys\n    s = tl.dot(q, tl.trans(k)) * alpha + bias\n    a = s * tl.sigmoid(s) * inv_n\n    a = tl.where((rel &gt;= 0) &amp; m_mask[:, None] &amp; n_mask[None, :], a, 0.0)\n    acc += tl.dot(a.to(v.dtype), v)</code></pre>\n<p>Use int64 for <code>start * stride_t</code>: with tens of millions of tokens × H × D, 32-bit offsets overflow.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/06_hstu_attention_fwd/run.py</code></pre>\n<p>The baseline is a <em>fair</em> dense PyTorch version: inputs already padded once (<code>padded_inputs</code>) so it is not charged for a Python loop, and bf16 throughout.</p>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "s200",
+       "label": "speedup at B=128, N≤200",
+       "ref": 10.4,
+       "unit": "×"
+      },
+      {
+       "key": "s200_dense_mb",
+       "label": "dense peak memory, B=128 N≤200",
+       "ref": 186.0,
+       "unit": "MB"
+      },
+      {
+       "key": "s200_fused_mb",
+       "label": "fused peak memory, B=128 N≤200",
+       "ref": 3.0,
+       "unit": "MB"
+      },
+      {
+       "key": "s512",
+       "label": "speedup at B=64, N≤512",
+       "ref": 31.9,
+       "unit": "×"
+      },
+      {
+       "key": "s512_fused_us",
+       "label": "fused time, B=64 N≤512",
+       "ref": 121.0,
+       "unit": "µs"
+      },
+      {
+       "key": "s2048",
+       "label": "speedup at N≤2048",
+       "ref": 12.9,
+       "unit": "×"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Where the 10–32× comes from.</strong> Three sources, roughly multiplicative:</p>\n<ul><li><strong>Memory traffic.</strong> Dense writes and rereads B·H·N² scores, plus bias tensors and masks: 994 MB at B=64, N=512. The fused kernel only reads Q, K, V once per query block and writes the output: 8.7 MB peak.</li><li><strong>Padding.</strong> Realistic histories are 45–52% padding in these batches. Dense computes all of it; fused programs past a user's length exit on their first instruction.</li><li><strong>Causality.</strong> Dense computes the full N×N and masks half away. The fused loop stops at <code>hi</code>, skipping blocks above the diagonal, which is about half the FLOPs.</li></ul>\n<p>The speedup peaks near N=512 and settles at 12–13× for long sequences. At large N the dense version becomes efficient big-GEMM work, while the fused kernel becomes compute-bound on its own <code>tl.dot</code>s.</p>\n<p><strong>The exponent trick is exact.</strong> A positive fp32 number is stored as <span class=\"math\">2<sup>e-127</sup> × 1.m</span>, so <code>(bits &gt;&gt; 23) - 127</code> is exactly <span class=\"math\">⌊ log<sub>2</sub> x ⌋</span>. The reference uses <code>torch.frexp</code>, whose exponent is one larger; the course reference subtracts 1, and the two agree on every input. No <code>log2</code>, no rounding risk at exact powers of two.</p>\n<p><strong>Why pointwise attention fuses so well.</strong> Softmax attention (flash attention) must keep a running max and rescale the accumulator whenever the max grows. HSTU's SiLU score is independent per element, so each block's contribution simply adds to <code>acc</code>. That makes it simpler than flash attention, and it is why the backward in Lab 07 needs no stored row statistics at all.</p>\n<p><strong>Why 1/N with N = max_len.</strong> HSTU normalises by sequence length rather than by a softmax. Using the batch's max_len (as the reference does) keeps the scale identical between the dense and fused paths.</p>"
+    }
+   ]
+  },
+  {
+   "id": "07",
+   "title": "HSTU attention backward",
+   "summary": "recompute instead of store, two-kernel FA2 split, and why naive atomics cost 70×",
+   "minutes": 120,
+   "lab": "labs/07_hstu_attention_bwd",
+   "track": "hstu",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Training needs gradients for Q, K, V and for the two bias tables. The forward saved only its inputs (no N×N matrices), so the backward <strong>recomputes</strong> scores tile by tile, exactly like flash attention.</p>\n<p>With <span class=\"math\">s = α  q· k + <span class=\"mr\">rab</span></span>, <span class=\"math\">σ = <span class=\"mr\">sigmoid</span>(s)</span>, <span class=\"math\">A = <span class=\"mr\">SiLU</span>(s)/N</span> (masked):</p>\n<table><thead><tr><th>Gradient</th><th>Formula</th></tr></thead><tbody><tr><td>dV</td><td><span class=\"math\">A<sup>ᵀ</sup> dO</span></td></tr><tr><td>dA</td><td><span class=\"math\">dO  V<sup>ᵀ</sup></span></td></tr><tr><td>dS</td><td><span class=\"math\">dA · σ (1 + s(1-σ)) / N</span>, since <span class=\"math\"><span class=\"mr\">SiLU</span>&#x27;(s) = σ(1 + s(1-σ))</span></td></tr><tr><td>dQ</td><td><span class=\"math\">α  dS  K</span></td></tr><tr><td>dK</td><td><span class=\"math\">α  dS<sup>ᵀ</sup> Q</span></td></tr><tr><td>dpos[b], dts[b]</td><td>sum of dS over entries that fall in bucket b</td></tr></tbody></table>\n<h3>Two kernels, no atomics on Q/K/V</h3>\n<p>dK and dV are sums over <em>query</em> rows; dQ is a sum over <em>key</em> rows. The FlashAttention-2 split:</p>\n<ul><li><strong>Kernel 1</strong> fixes a block of BN keys and loops over query blocks <span class=\"math\">i ≥ j</span>, accumulating dK and dV in registers. It also produces the bias-table gradients.</li><li><strong>Kernel 2</strong> fixes a block of BM queries and loops over key blocks <span class=\"math\">j ≤ i</span>, accumulating dQ.</li></ul>\n<p>Each output block has exactly one owner, so dQ, dK and dV are plain stores.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/07_hstu_attention_bwd/kernel.py</code>.</p>\n<p><strong>The shared tile (TODOs 1–3)</strong> in <code>_ds_tile</code>: recompute <code>s</code>, the bias, <code>sig</code>, the validity mask and <code>a</code>, then</p>\n<pre><code class=\"lang-python\">da = tl.dot(do, tl.trans(v))\nds = tl.where(valid, da * sig * (1.0 + s * (1.0 - sig)) * inv_n, 0.0)</code></pre>\n<p><strong>Kernel 1 (TODOs 4–5):</strong> <code>dv += tl.dot(tl.trans(a.to(do.dtype)), do)</code>, <code>dk += tl.dot(tl.trans(ds.to(q.dtype)), q)</code>, and scale dk by alpha once at the end.</p>\n<p>For the bias tables, <strong>first write the obvious version</strong>: <code>tl.atomic_add(dpos_ptr + pos_b, ds, mask=valid)</code> into one shared table of P floats. Run it and record the time. Then give every program its own private row:</p>\n<pre><code class=\"lang-python\">row = (pid_bh * tl.num_programs(0) + pid_n).to(tl.int64)\ntl.atomic_add(dpos_ptr + row * P + pos_b, ds, mask=valid, sem=&quot;relaxed&quot;)</code></pre>\n<p>and sum the rows on the host side with <code>dpos.sum(0)</code>. Size the buffer for the smallest BN in the autotune list, and add <code>reset_to_zero=[&quot;dpos_ptr&quot;, &quot;dts_ptr&quot;]</code> to the autotuner. Otherwise each benchmarking trial adds into the same buffer.</p>\n<p><strong>Kernel 2 (TODO 6):</strong> <code>dq += tl.dot(ds.to(k.dtype), k)</code>.</p>\n<p><strong>Autograd (TODO 7):</strong> return one gradient per forward input, <code>None</code> for ts, offsets, max_len and alpha.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/07_hstu_attention_bwd/run.py</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "naive_atomic_us",
+       "label": "backward with one shared bias table (your first version)",
+       "ref": 33285.0,
+       "unit": "µs"
+      },
+      {
+       "key": "private_us",
+       "label": "backward with private rows",
+       "ref": 474.0,
+       "unit": "µs"
+      },
+      {
+       "key": "fb200",
+       "label": "forward+backward speedup, B=128 N≤200",
+       "ref": 20.4,
+       "unit": "×"
+      },
+      {
+       "key": "fb512",
+       "label": "forward+backward speedup, B=64 N≤512",
+       "ref": 31.7,
+       "unit": "×"
+      },
+      {
+       "key": "fb512_mb",
+       "label": "fused fwd+bwd peak memory, B=64 N≤512",
+       "ref": 48.0,
+       "unit": "MB"
+      },
+      {
+       "key": "fb2048",
+       "label": "forward+backward speedup, N≤2048",
+       "ref": 6.5,
+       "unit": "×"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>The atomics cliff: 33 ms vs 0.47 ms.</strong> The position table has 256 entries and the time table 32. With one shared copy, every one of thousands of programs fires BM·BN atomic adds per tile into the same 288 addresses. Atomics on the same address serialise at the L2 slice that owns that cache line, so the whole GPU queues behind a few cache lines. Private rows remove all cross-program contention. Within a program, the compiler can combine lanes that hit the same address. The final <code>sum(0)</code> over a few thousand rows of 256 floats is a trivial reduction.</p>\n<p>The general rule: <strong>atomics are cheap when addresses are spread out and catastrophic when they are hot.</strong> Make reductions hierarchical: private, then local, then global.</p>\n<p><strong>Recompute vs store.</strong> Storing A for backward would cost B·H·N² bf16 values, about 1 GB at B=64, N=512. Recomputing it costs one extra <code>QKᵀ</code> per tile, which the tensor cores do far faster than HBM could reload it. Fused peak memory for forward+backward is 48 MB vs 996 MB dense.</p>\n<p><strong>Why the speedup is larger than the forward alone (20–32×).</strong> The dense backward through PyTorch autograd also materialises dS, dA and the gathered bias gradient as N² tensors. The bias backward through advanced indexing originally took 1.26 s until the course reference switched to <code>bincount</code> (<code>TableGather</code> in <code>gk/hstu_ref.py</code>). The fused version adds two kernels and no new N² traffic.</p>\n<p><strong>Why it shrinks at N=2048 (6.5×).</strong> Each fused backward program now loops over long key or query ranges and is compute-bound, recomputing <code>QKᵀ</code> twice (once per kernel). The dense path, meanwhile, is doing large efficient GEMMs. Production kernels fuse dQ into kernel 1 with atomics on dQ, or use warp specialization, to claw this back.</p>\n<p>**<code>reset_to_zero</code> matters.** The autotuner runs each config several times on the same buffers. Without zeroing, the accumulated bias gradients grow with every trial and your correctness check fails, but only the first time you run.</p>"
+    }
+   ]
+  },
+  {
+   "id": "08",
+   "title": "Stitch the kernels into an HSTU model",
+   "summary": "one HSTU layer from Labs 03, 04, 06 and 07; autograd glue; check against plain PyTorch",
+   "minutes": 90,
+   "lab": "labs/08_hstu_model",
+   "track": "hstu",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Everything so far was one kernel at a time. Now they become a model. One HSTU layer on the jagged token matrix <code>x</code> of shape <code>(T, d)</code>:</p>\n<pre><code class=\"lang-text\">h          = LayerNorm(x)\nu, v, q, k = split(SiLU(h @ W_uvqk))          Lab 04: one fused GEMM + SiLU for all four projections\na          = HSTUAttention(q, k, v, ts, rab)  Labs 06 + 07: jagged fused attention, fwd + bwd\ny          = LayerNorm(a) * u                 Lab 03: fused norm + gate\nx          = x + Dropout(y @ W_o)</code></pre>\n<p>The full model embeds item ids (plus an optional learned position embedding), stacks layers, L2-normalises the output, and scores the next item by cosine similarity against the item embedding table. Item and output embeddings are tied.</p>\n<p><code>gk/kernels.py</code> loads your <code>kernel.py</code> from each lab when <code>GK_KERNELS=mine</code> is set, and the reference <code>solution.py</code> otherwise. So you can run the model on your own kernels end to end.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p><code>labs/08_hstu_model/kernel.py</code>.</p>\n<p><strong>TODO 1: MatmulSiLU backward.</strong> The forward uses the Lab 04 kernel and saves only <code>a</code> and <code>w</code>. In backward, recompute the pre-activation with cuBLAS:</p>\n<pre><code class=\"lang-python\">z = (a @ w_t.t()).float()\nsig = torch.sigmoid(z)\ndz = (dy.float() * sig * (1 + z * (1 - sig))).to(a.dtype)\nreturn dz @ w_t, dz.t() @ a</code></pre>\n<p><strong>TODOs 2–4: the block forward.</strong></p>\n<pre><code class=\"lang-python\">uvqk = MatmulSiLU.apply(h.to(torch.bfloat16), self.w_uvqk.to(torch.bfloat16))\nu, v, q, k = uvqk.split(H * dh, dim=1)\na = kernels.hstu_attention()(q, k, v, ts, offsets, max_len, self.pos_w, self.ts_w, alpha)\ny = kernels.ln_mul()(a.reshape(T, H * dh), u.contiguous(), self.norm_w, self.norm_b)</code></pre>\n<p><strong>TODO 5: the sampled softmax loss.</strong> Score each position's state against its true next item and <code>num_neg</code> shared random negatives, divide by a temperature (0.05), and take cross-entropy with the positive at index 0. Mask a negative that happens to equal the target. <code>num_neg=0</code> means full softmax over the catalogue.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/08_hstu_model/run.py\nGK_KERNELS=mine python labs/08_hstu_model/run.py     # the model on *your* kernels from labs 03/04/07</code></pre>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "fwd_diff",
+       "label": "forward max abs diff vs PyTorch",
+       "ref": 0.0045,
+       "unit": ""
+      },
+      {
+       "key": "grad_err",
+       "label": "worst relative gradient error",
+       "ref": 0.0111,
+       "unit": ""
+      },
+      {
+       "key": "b128_torch",
+       "label": "step time torch, B=128 N=200",
+       "ref": 27.1,
+       "unit": "ms"
+      },
+      {
+       "key": "b128_triton",
+       "label": "step time triton, B=128 N=200",
+       "ref": 6.5,
+       "unit": "ms"
+      },
+      {
+       "key": "b64_torch_mb",
+       "label": "peak memory torch, B=64 N=512",
+       "ref": 1042.0,
+       "unit": "MB"
+      },
+      {
+       "key": "b64_triton_mb",
+       "label": "peak memory triton, B=64 N=512",
+       "ref": 144.0,
+       "unit": "MB"
+      },
+      {
+       "key": "b32_triton",
+       "label": "step time triton, B=32 N=1024",
+       "ref": 12.1,
+       "unit": "ms"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Correctness at bf16 precision.</strong> Forward outputs agree to about 4.5e-3 and every parameter gradient to about 1% relative error. That is what bf16 matmuls in two different orders produce. The check compares <em>every</em> parameter's gradient, including the bias tables, which is where a wrong atomic or a missing <code>alpha</code> shows up first.</p>\n<p><strong>4× faster, 7× less memory.</strong> The step includes forward, backward, the loss and AdamW. Memory is the clearer story: the dense path's peak grows with N² (365 MB at N=200 → 1042 MB at 512 → 2006 MB at 1024) while the fused path stays near 120–150 MB, because nothing N×N exists. Step-time ratios move around between runs (this GPU is shared), but the triton step is consistently 4–5× faster at N=200–512.</p>\n<p><strong>Why the speedup shrinks at N=1024 (about 1.3×).</strong> At B=32 the dense path is a few large batched GEMMs, efficient on tensor cores. The fused attention backward loops over 1024 keys per program and recomputes scores twice, which is the compute-bound regime from Lab 07.</p>\n<p><strong>What the step is made of now.</strong> At the ML-1M shape the attention kernels are no longer the bottleneck; Lab 11's profile shows the fp32 loss GEMMs, softmax, AdamW and launch overhead on top. Fusion moves the bottleneck; it never removes it.</p>\n<p><strong>Recompute in MatmulSiLU.</strong> Saving <code>z</code> (T × 4·H·dh) per layer would cost more memory than all the attention state. Recomputing it is one skinny cuBLAS GEMM, about 37 µs at the Lab 04 shape.</p>\n<p><strong>Why the dropout and residual stay in PyTorch.</strong> They are cheap elementwise ops on (T, d) with d=64. Fusing them would save microseconds. Always fuse in the order of bytes saved, which is the order this course followed.</p>"
+    }
+   ]
+  },
+  {
+   "id": "09",
+   "title": "Train HSTU on MovieLens-1M",
+   "summary": "GPU-resident jagged batches, full-ranking HR@10 / NDCG@10, and an ablation you run yourself",
+   "minutes": 90,
+   "lab": "train",
+   "track": "train",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Now the model learns something real. <strong>MovieLens-1M</strong> has 1,000,209 ratings from 6,040 users on 3,706 movies, each with a timestamp. The task: given a user's history in time order, predict the next movie.</p>\n<p><strong>Protocol</strong> (the one used in the HSTU and SASRec papers):</p>\n<ul><li>The last interaction of each user is the test target; everything before it is history.</li><li>Train on next-item prediction at every position of the history (teacher forcing), with up to 200 most recent events.</li><li>Evaluate with <strong>full ranking</strong>: score all 3,706 movies, then compute <strong>HR@10</strong> (is the true movie in the top 10?) and <strong>NDCG@10</strong> (rewards higher positions: 1/log₂(rank+1)).</li></ul>\n<p><strong>The data pipeline is on the GPU.</strong> <code>train/train.py</code> loads the whole dataset as tensors once. Each batch picks random users, slices their tails with vectorised index arithmetic, and builds <code>offsets</code>. No DataLoader and no host-to-device copies per step: at about 8 ms per step a CPU pipeline would be the bottleneck.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Nothing new to write; this lab is about experiments. Read <code>train/train.py</code> first: <code>GPUSequences.batch</code>, <code>evaluate</code>, and the training loop. Then download the data:</p>\n<pre><code class=\"lang-bash\">python train/data.py --dataset ml-1m        # into data/ml-1m.npz</code></pre>"
+    },
+    {
+     "kind": "run",
+     "html": "<p>Baseline, then the experiments. Each run prints the loss, step time and tokens/s, and HR@10 / NDCG@10 every 10 epochs.</p>\n<pre><code class=\"lang-bash\">python train/train.py --epochs 100                                          # baseline: 2 layers, 512 negatives\npython train/train.py --epochs 200 --pos-emb --out checkpoints/exp_pos.pt   # + position embedding\npython train/train.py --epochs 200 --pos-emb --negatives 0 --out checkpoints/exp_full.pt  # + full softmax\npython train/train.py --epochs 200 --pos-emb --negatives 0 --layers 4      # final recipe -&gt; checkpoints/hstu_ml-1m.pt</code></pre>\n<p>Add <code>--impl torch</code> to any run to train the identical model without the custom kernels.</p>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "base_hr",
+       "label": "baseline HR@10, 100 epochs",
+       "ref": 0.2353,
+       "unit": ""
+      },
+      {
+       "key": "base_ndcg",
+       "label": "baseline NDCG@10",
+       "ref": 0.1183,
+       "unit": ""
+      },
+      {
+       "key": "full_hr",
+       "label": "full softmax + pos emb, HR@10",
+       "ref": 0.2651,
+       "unit": ""
+      },
+      {
+       "key": "l4_hr",
+       "label": "4 layers, full softmax, pos emb, HR@10",
+       "ref": 0.282,
+       "unit": ""
+      },
+      {
+       "key": "l4_ndcg",
+       "label": "4 layers, NDCG@10",
+       "ref": 0.1557,
+       "unit": ""
+      },
+      {
+       "key": "epoch_s",
+       "label": "seconds per epoch, 2 layers",
+       "ref": 0.4,
+       "unit": "s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>The ablation on the course GB200</strong> (best HR@10 / NDCG@10 over the run):</p>\n<table><thead><tr><th>Change</th><th>HR@10</th><th>NDCG@10</th></tr></thead><tbody><tr><td>baseline: 2 layers, d=64, 512 negatives, 100 epochs</td><td>0.2353</td><td>0.1183</td></tr><tr><td>200 epochs</td><td>0.2502</td><td>0.1275</td></tr><tr><td>+ position embedding</td><td>0.2508</td><td>0.1308</td></tr><tr><td>128 negatives instead of 512</td><td>0.2253</td><td>—</td></tr><tr><td>full softmax (all 3,706 items)</td><td>0.2621</td><td>0.1445</td></tr><tr><td>full softmax + position embedding</td><td>0.2651</td><td>0.1460</td></tr><tr><td>d=128</td><td>0.2687</td><td>0.1570</td></tr><tr><td><strong>4 layers + full softmax + pos emb</strong></td><td><strong>0.2820</strong></td><td><strong>0.1557</strong></td></tr><tr><td>4 layers, d=128</td><td>0.2750</td><td>0.1562</td></tr><tr><td><em>paper: SASRec</em></td><td><em>0.2853</em></td><td><em>0.1603</em></td></tr><tr><td><em>paper: HSTU</em></td><td><em>0.3097</em></td><td><em>0.1720</em></td></tr></tbody></table>\n<p><strong>What each change teaches.</strong></p>\n<ul><li><strong>Negatives matter most.</strong> The softmax denominator over 128 random negatives is a noisy, biased estimate, because random negatives are mostly easy. Going 128 → 512 → full raises HR by 4 points. With 3,706 items, full softmax is one (T × 3706) GEMM, cheap enough, so use it. At YouTube scale (millions of items) you cannot, and the sampling strategy becomes a research topic.</li><li><strong>Depth beats width here.</strong> 4 layers gains 1.7 points; doubling d gains less, and 4 layers at d=128 overfits ML-1M's 6,040 users.</li><li><strong>Timestamps already encode order.</strong> The absolute position embedding adds little on top of the relative time-and-position bias.</li></ul>\n<p>The remaining gap to the paper's HSTU (0.31) comes from tuning (learning-rate schedule, longer training, dropout schedule and seeds). The paper reports its best configurations. Treat our numbers as a reproducible, honest baseline, not a leaderboard entry.</p>\n<p><strong>Throughput.</strong> About 0.4 s per epoch with 2 layers (48 steps of 128 users, about 1.6 M tokens/s); 4 layers takes about 0.85 s. The GPU is mostly <em>idle</em> during these steps, because the batch is small and each step launches about 280 kernels. Lab 11 measures exactly how idle, and what to do about it.</p>\n<p><strong>The bug this lab found.</strong> The first training run hung for minutes per step. The Lab 04 GEMM's autotune key included M, and the jagged token count changes every batch, so every step re-ran the autotuner. Bucketing M to the next power of two fixed it. Real workloads find bugs that microbenchmarks never do.</p>"
+    }
+   ]
+  },
+  {
+   "id": "10",
+   "title": "Serve with Triton Inference Server",
+   "summary": "Python-backend model repository, ragged dynamic batching into one jagged batch, load testing",
+   "minutes": 90,
+   "lab": "serving",
+   "track": "serve",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Two different things are both called \"Triton\". <strong>Triton the language</strong> is what you wrote kernels in. <strong>Triton Inference Server</strong> is NVIDIA's model server: it takes HTTP/gRPC requests, queues them, forms batches and runs models through backends (TensorRT, ONNX, PyTorch, Python, and others). This lab serves the trained HSTU through the <strong>Python backend</strong>, so the same Triton kernels run inside the server.</p>\n<h3>The model repository</h3>\n<pre><code class=\"lang-text\">serving/model_repository/\n  hstu/            config.pbtxt + 1/model.py    dynamic batching on\n  hstu_nobatch/    config.pbtxt + 1/model.py    one request at a time</code></pre>\n<p>Each request is one user: a variable-length list of item ids and timestamps. The key configuration:</p>\n<pre><code class=\"lang-text\">max_batch_size: 128\ninput [ { name: &quot;item_ids&quot; data_type: TYPE_INT64 dims: [ -1 ] allow_ragged_batch: true }, ... ]\ndynamic_batching { max_queue_delay_microseconds: 2000  preferred_batch_size: [ 32, 64, 128 ] }</code></pre>\n<p><code>allow_ragged_batch</code> lets requests of <em>different lengths</em> be grouped. <code>execute()</code> (in <code>serving/hstu_backend.py</code>) receives the group, concatenates the histories and builds <code>offsets</code>. That is a jagged batch, exactly what the attention kernel wants. Batching costs zero padding.</p>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Read <code>serving/hstu_backend.py</code>: <code>initialize</code> loads the checkpoint and warms the kernels up; <code>execute</code> builds the jagged batch and returns top-10 items per request.</p>\n<p><strong>One sharp edge you will meet.</strong> Tensors cross into and out of the backend through <strong>DLPack</strong> (<code>pb_utils.Tensor.from_dlpack</code>, <code>to_dlpack</code>), not <code>as_numpy()</code> and <code>pb_utils.Tensor(name, ndarray)</code>. The server's stub is compiled against the numpy 1.x C ABI. Given numpy 2 arrays, it misreads their element size and every response fails with \"output tensor shape does not match size of output\". DLPack bypasses numpy entirely.</p>\n<p>Set up the server once (no Docker: it unpacks the server binaries shipped in the <code>nvidia-pytriton</code> wheel and builds a matching Python 3.13 for the backend stub):</p>\n<pre><code class=\"lang-bash\">bash serving/setup_tritonserver.sh</code></pre>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">bash serving/start_server.sh &amp;                 # wait for &quot;Started GRPCInferenceService&quot;\npython serving/client.py                       # correctness on 50 users, then the load test</code></pre>\n<p>The load test runs N closed-loop clients (each sends the next request when the previous returns) for 1, 8, 32 and 128 clients, against both models. Run it twice and keep the second, warm run.</p>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "agree",
+       "label": "users whose served top-10 equals offline top-10 (of 50)",
+       "ref": 50.0,
+       "unit": ""
+      },
+      {
+       "key": "nb_1",
+       "label": "no batching, 1 client",
+       "ref": 181.0,
+       "unit": "req/s"
+      },
+      {
+       "key": "nb_128",
+       "label": "no batching, 128 clients",
+       "ref": 270.0,
+       "unit": "req/s"
+      },
+      {
+       "key": "nb_128_p99",
+       "label": "no batching, 128 clients, p99",
+       "ref": 633.0,
+       "unit": "ms"
+      },
+      {
+       "key": "db_128",
+       "label": "dynamic batching, 128 clients",
+       "ref": 3940.0,
+       "unit": "req/s"
+      },
+      {
+       "key": "db_128_p99",
+       "label": "dynamic batching, 128 clients, p99",
+       "ref": 66.0,
+       "unit": "ms"
+      },
+      {
+       "key": "db_128_bs",
+       "label": "mean batch size formed, 128 clients",
+       "ref": 48.4,
+       "unit": ""
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>Throughput: 270 → 3,940 req/s (14.6×) at 128 clients.</strong> Without batching, each request is one forward pass of about 5 ms: 4 layers of about 10 tiny kernels each, plus top-k, for a single user of at most 200 tokens. The GPU does almost no work per launch, so the server saturates at 1 / 5 ms ≈ 200–270 req/s no matter how many clients wait. Queueing makes p99 explode to 633 ms.</p>\n<p>With dynamic batching, the scheduler holds requests up to 2 ms and hands <code>execute()</code> up to 128 at once. A batch of 48 users costs barely more GPU time than a batch of 1, because the same launches simply do more work each. That is the same launch-bound regime as training (Lab 11). Throughput grows with the batch size the scheduler forms (mean 48.4 at 128 clients), and p99 <em>falls</em> to 66 ms.</p>\n<p><strong>At 1 client batching costs a little.</strong> 181 vs 141 req/s: the batcher waits for companions that never come. <code>max_queue_delay_microseconds</code> is the knob between latency at low load and throughput at high load.</p>\n<p><strong>Cold start is real.</strong> The first, cold run showed a p99 of 1.56 s at 1 client: each model instance is its own process, and kernels it had not seen yet (new autotune keys) compiled on the first requests. <code>initialize()</code> warms up a few shapes; production servers warm up every shape bucket and persist the Triton cache (Lab 11, part D).</p>\n<p><strong>Correctness first.</strong> The client compares the served top-10 with the offline model for 50 real users: 50/50 identical. Batching changes nothing about each user's result, because the jagged kernel never mixes users.</p>"
+    }
+   ]
+  },
+  {
+   "id": "11",
+   "title": "System optimisation",
+   "summary": "profile the whole step, find the launch-bound regime, batch scaling, CUDA graphs for jagged shapes, compile caches",
+   "minutes": 90,
+   "lab": "labs/11_system_opt",
+   "track": "systems",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>Fast kernels are necessary, not sufficient. Once the big kernels are fused, the step is made of everything <em>between</em> them: the CPU issuing launches, small PyTorch ops, the optimizer, the loss, and start-up compilation. This lab measures all of it in four parts:</p>\n<ul><li><strong>A. GPU-bound or CPU-bound?</strong> Profile 20 training steps; GPU busy time ÷ wall time; kernels per step; the kernels that dominate.</li><li><strong>B. Batch scaling.</strong> Step time and tokens/s from 32 to 2048 users.</li><li><strong>C. CUDA graphs for jagged inference.</strong> Record the whole top-k forward once and replay it with one launch.</li><li><strong>D. Compile caches.</strong> Time to the first training step in a fresh process, cold vs warm <code>TRITON_CACHE_DIR</code>, with and without <code>TRITON_CACHE_AUTOTUNING=1</code>.</li></ul>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Read <code>labs/11_system_opt/cuda_graphs.py</code> (<code>GraphedTopK</code>). CUDA graphs need <strong>static shapes and static addresses</strong>, but jagged batches change every call. The trick:</p>\n<ul><li>Capture one graph per <strong>bucket</strong> (B users, T tokens): (1, 256), (8, 2048), (64, 16384).</li><li>Copy a real batch into the bucket's static buffers; unused user slots get length 0 (<code>offsets</code> repeat).</li><li>One <strong>dummy user</strong> at index B owns the unused token tail, so the jagged kernels see a consistent layout. Its outputs are thrown away.</li><li>Run once <em>before</em> capture so Triton compiles and autotunes outside the graph (compilation cannot be captured).</li></ul>\n<p>Exercise after the run: wire <code>GraphedTopK</code> into <code>serving/hstu_backend.py</code> and rerun the Lab 10 load test.</p>"
+    },
+    {
+     "kind": "run",
+     "html": "<pre><code class=\"lang-bash\">python labs/11_system_opt/run.py</code></pre>\n<p>Part D spawns fresh Python processes with empty and then warm cache directories, so it takes a minute.</p>"
+    },
+    {
+     "kind": "measure",
+     "fields": [
+      {
+       "key": "busy",
+       "label": "GPU busy fraction, triton step, B=128",
+       "ref": 22.0,
+       "unit": "%"
+      },
+      {
+       "key": "kernels",
+       "label": "kernels launched per triton step",
+       "ref": 278.0,
+       "unit": ""
+      },
+      {
+       "key": "step_ms",
+       "label": "triton step time, B=128",
+       "ref": 10.5,
+       "unit": "ms"
+      },
+      {
+       "key": "tok32",
+       "label": "tokens/s at 32 users",
+       "ref": 0.4,
+       "unit": "Mtok/s"
+      },
+      {
+       "key": "tok2048",
+       "label": "tokens/s at 2048 users",
+       "ref": 7.65,
+       "unit": "Mtok/s"
+      },
+      {
+       "key": "eager_us",
+       "label": "eager top-10, 1 user",
+       "ref": 2617.0,
+       "unit": "µs"
+      },
+      {
+       "key": "graph_us",
+       "label": "CUDA graph top-10, 1 user",
+       "ref": 174.0,
+       "unit": "µs"
+      },
+      {
+       "key": "cold_s",
+       "label": "first step, cold cache",
+       "ref": 17.0,
+       "unit": "s"
+      },
+      {
+       "key": "warm_s",
+       "label": "first step, warm kernel + autotune cache",
+       "ref": 2.7,
+       "unit": "s"
+      }
+     ]
+    },
+    {
+     "kind": "explain",
+     "html": "<p><strong>A. The GPU is idle almost 80% of the step.</strong> 278 kernels in about 10 ms, while summed GPU kernel time is about 2.3 ms. The rest is the CPU: Python, autograd bookkeeping, and about 5–10 µs to issue each launch. This is the <strong>launch-bound</strong> regime, and at B=128 on ML-1M the model lives in it. (Timings under the profiler, and on a shared GPU, wobble by ±30% between runs; the busy fraction is the stable signal.)</p>\n<p>The top GPU kernels are now <em>not</em> ours: the softmax backward and SIMT <code>sgemm</code> kernels of the <strong>fp32 loss</strong>, then AdamW. The <code>simt_sgemm</code> name is the tell: these are fp32 GEMMs on CUDA cores, not tensor cores, because the logits are computed in fp32. Next steps, in order of payoff: compute the logits GEMM in bf16 (or allow TF32), fuse the loss into a cross-entropy kernel that never writes the (T × 3706) logits, and keep using the fused AdamW (<code>fused=True</code>).</p>\n<p><strong>B. Batch scaling is almost free throughput.</strong> From 32 to 512 users, tokens per step grow 16× while step time barely moves (about 7.3–7.5 ms), so tokens/s grow about 16×. Only at 2048 users (204K tokens) does the GPU finally become the bottleneck: 26.7 ms per step, 7.65 M tokens/s, 19× the 32-user rate. For recommendation training, the batch size is a systems knob as much as an optimisation one. Larger batches need learning-rate retuning, but the hardware wants them.</p>\n<p><strong>C. CUDA graphs: about 15× lower latency for one user.</strong> Eager top-10 for one user takes about 2.6 ms, nearly all CPU launch overhead across 4 layers. Replaying the graph issues one launch for the whole forward: 174 µs. At 64 users the gain shrinks (7.5×), because more of the time is real GPU work. Results are identical (<code>same top-10 = True</code>). The padding-to-buckets cost is invisible next to the launch savings. This is why production inference servers capture graphs per shape bucket.</p>\n<p><strong>D. Start-up: 17 s → 2.7 s.</strong> A cold process compiles every Triton kernel and autotunes each config set: about 17 s before the first step. A warm <code>TRITON_CACHE_DIR</code> skips compilation but still benchmarks configs (6.8 s). Adding <code>TRITON_CACHE_AUTOTUNING=1</code> caches the autotune decision too (2.7 s). In serving, the same cache is the difference between a 1.5 s cold p99 and a 10 ms p99 (Lab 10). Lesson 12 shows the conference work that pushes this further: shared remote autotune caches and learned config predictors.</p>"
+    }
+   ]
+  },
+  {
+   "id": "12",
+   "title": "Field notes from Triton Developer Conference 2026",
+   "summary": "twelve posters mapped onto what you built: autotuning cost, compilers under Triton, Gluon, multi-GPU, AOT serving",
+   "minutes": 45,
+   "lab": "",
+   "track": "frontier",
+   "sections": [
+    {
+     "kind": "read",
+     "html": "<p>The conference posters cluster around four problems you have already hit in this course. Each section links a poster to the lab where you met the problem.</p>\n<h3>1. Autotuning is too slow (Labs 04, 09, 11 D)</h3>\n<p>You saw it three times: an autotune key that re-tuned every step (Lab 09), 17 s of cold start (Lab 11), and a 1.5 s cold p99 in serving (Lab 10). Five posters attack it:</p>\n<table><thead><tr><th>Poster</th><th>Idea</th><th>Reported result</th></tr></thead><tbody><tr><td><strong>Helion warm-start + shared caches</strong> (Red Hat)</td><td>Helion's exact cache key hashes the kernel <em>source</em>, so any edit discards tuning. A <em>loose</em> key (dtypes, shapes, strides, hardware, plus a structural hash of the config space) seeds the search with cached winners (<code>FROM_BEST_AVAILABLE</code>), the default config stays pinned, and a <code>RemoteCache</code> ABC (get / put / list over Redis, S3 or HTTP) shares winners across developers and CI.</td><td>1238 s → 92 s (13×) autotuning with the same winning quality. Enable with <code>HELION_AUTOTUNE_CACHE=…</code></td></tr><tr><td><strong>TritonPPM</strong> (Meta)</td><td>Static analysis of the Triton kernel computes symbolic work per block (bytes, FLOPs, registers, spills, pipelining); about 15 roofline-style features feed an XGBoost runtime model trained on about 250K B200 launches. Rank configs, benchmark only the top k.</td><td>&lt; 0.5 s per kernel; at k=10, &lt; 6% regret at p90; on unseen kernels, 10% better geomean by searching 30× larger spaces with 2.5× less resource</td></tr><tr><td><strong>Diode</strong> (Meta, PT2 Inductor)</td><td>A residual MLP on the CPU predicts log-runtime of each GEMM config from shape, dtype, strides and GPU; Inductor compiles and benchmarks only the top-K against cuBLAS.</td><td>Compile+autotune time cut 14–57% on production workloads with QPS and NE preserved; per-shape tuning time 80–87% lower at K=1</td></tr><tr><td><strong>CompileIQ</strong> (NVIDIA)</td><td>Autotuners search tiles, warps and stages; CompileIQ searches <em>PTXAS's</em> internal controls (register allocation, scheduling, unrolling) with an evolutionary search and ships the result as an \"advanced control file\".</td><td>5% geomean over 12 TritonBench kernels on B200 vs default PTXAS. In Triton: <code>ptx_options=&quot;--apply-controls=best.acf&quot;</code>; <code>pip install compileiq</code></td></tr><tr><td><strong>AOT-Tensor</strong> (Meta)</td><td>Record each kernel's specialisations and autotune picks during one forward pass, compile them ahead of time into one <code>.so</code> per kernel with generated dispatch guards, and rewrite call sites into torch ops so a C++-only server can run them.</td><td>In production for large ranking models, 70+ kernels, parity with JIT Triton. Open source in <code>meta-pytorch/torchinfer</code></td></tr></tbody></table>\n<p>The common thread: <strong>measuring is the expensive part, so predict, cache, or move it offline.</strong> Your <code>TRITON_CACHE_AUTOTUNING=1</code> result in Lab 11 is the simplest member of this family.</p>\n<h3>2. Lower-level control: Gluon and correct-by-construction pipelines (Labs 01, 04)</h3>\n<ul><li><strong>TokenSpeed-Kernel</strong> (AMD / LightSeek) writes LLM attention and MoE kernels in Gluon for AMD CDNA4: explicit <code>async_copy</code> double buffering, sub-tiled loads to cut register pressure, <code>convert_layout(..., assert_trivial=True)</code> to <em>prove</em> a layout conversion moves no data, serpentine CTA ordering to balance causal attention, and warp-pipeline stages. That is the same layout control you used in Lab 01's <code>BlockedLayout</code>, at production scale.</li><li><strong>A provably-correct pipeline DSL</strong> lowered to Gluon: a human writes the algorithm, an LLM or human supplies the <em>schedule</em> (stages), and the compiler injects waits, sizes buffers, and peels prologue and epilogue. Races are ruled out at compile time. That is the hand-written version of what <code>warp_specialize=True</code> did for you in Lab 04.</li><li><strong>Beyond powers of two</strong> (Meta): mixed-radix <code>LinearLayout</code>s let tiles like N=192 or K=96 compile exactly instead of padding to 256. Example: an N=192 WGMMA tile fits a 3-stage pipeline in 192 KB of shared memory, where padded 256 needs 256 KB (over the 227 KB limit) and drops to 2 stages. Exact tiles gave 1.2–1.3× for head-dim-192 attention on H100.</li></ul>\n<h3>3. Copy and launch overhead in real serving (Labs 01, 10, 11)</h3>\n<ul><li><strong>vLLM hybrid-model state</strong> (IBM): SSM state copies for prefix caching plus speculative decoding put the CPU on the decode critical path. Fixes, merged in vLLM PRs #40172, #48110 and #49436: a fused Triton kernel that does the copy logic <em>and</em> the copies on the GPU (about 30% decode throughput), 8-byte vectorised copies instead of byte copies (Lab 01's lesson exactly), and a 3-D-grid tiled copy that splits one state across SMs (over 80% of H200 bandwidth at just 4 requests).</li></ul>\n<h3>4. Beyond one GPU (forward-looking)</h3>\n<ul><li><strong>Iris on AMD Helios</strong> (AMD): symmetric heaps make peer GPU memory addressable from Triton (<code>iris.store(remote_ptr, …)</code>). MoE dispatch becomes \"compute where expert 47's buffer lives and store there\". Push beats pull by 3.4–4.3× on Helios.</li><li><strong>Triton IR → Chakra → ASTRA-sim</strong> (Marvell): convert compiled Triton IR into a portable execution trace and simulate multi-GPU timing for hardware that doesn't exist yet.</li><li><strong>FlagOS KernelGen</strong>: an execution-driven agent loop (generate → compile → validate → benchmark → profile → record evidence) that produces Triton kernels for 20+ chip vendors.</li></ul>"
+    },
+    {
+     "kind": "write",
+     "html": "<p>Pick one exercise and apply a conference idea to this course's code:</p>\n<ol><li><strong>Loose-key autotune cache (Helion/Diode).</strong> Record the winning config of <code>matmul_tma_kernel</code> for each <code>(M_BUCKET, N, K)</code> in a JSON file; on start-up, pass only the cached winner plus the default as <code>configs</code>. Measure first-step time against Lab 11 D.</li><li><strong>Predict, then benchmark (TritonPPM).</strong> For the six <code>TMA_CONFIGS</code>, compute a roofline estimate (bytes per tile ÷ bandwidth vs FLOPs ÷ peak) and check whether it ranks the configs the way the autotuner did.</li><li><strong>AOT for serving (AOT-T).</strong> List every Triton kernel and autotune key the serving model hits in <code>_warmup</code>, and extend the warm-up so the Lab 10 cold p99 disappears.</li></ol>"
+    },
+    {
+     "kind": "note",
+     "html": "<p>The numbers in this lesson are the posters' claims, as presented. They were not reproduced on the course GPU. Treat them like any CLAIM line: measure before you rely on them.</p>"
+    }
+   ]
+  }
+ ],
+ "cards": [
+  {
+   "q": "What is the ridge point of a roofline, and how do you compute it?",
+   "a": "Peak FLOP/s divided by peak bytes/s. Kernels below it (in FLOPs per byte moved) are memory-bound, above it compute-bound. On the course GB200: about 1741 TFLOP/s ÷ 6.6 TB/s ≈ 262 FLOP/byte.",
+   "id": "00-1",
+   "lesson": "00"
+  },
+  {
+   "q": "What does one Triton <em>program</em> correspond to in CUDA?",
+   "a": "One thread block. It runs on a single SM; the threads inside it are managed by the compiler according to <code>num_warps</code>.",
+   "id": "00-2",
+   "lesson": "00"
+  },
+  {
+   "q": "Why does a GPU keep many warps resident on each SM?",
+   "a": "To hide memory latency: while one warp waits hundreds of cycles for HBM, the scheduler issues instructions from another warp that is ready.",
+   "id": "00-3",
+   "lesson": "00"
+  },
+  {
+   "q": "List the GPU memory hierarchy from fastest to slowest.",
+   "a": "Registers (per thread) → shared memory / L1 (per SM, up to 227 KB per block on GB200) → L2 (129 MiB, shared by all SMs) → HBM.",
+   "id": "00-4",
+   "lesson": "00"
+  },
+  {
+   "q": "Which four lines does every lab's run.py print at the end?",
+   "a": "CLAIM, MEASURED, VERDICT, NEXT.",
+   "id": "00-5",
+   "lesson": "00"
+  },
+  {
+   "q": "In Triton, what does <code>tl.arange(0, BLOCK)</code> inside a program represent?",
+   "a": "The vector of BLOCK lane offsets that this one program processes. The compiler maps those lanes onto the program's threads; you never index threads directly.",
+   "id": "01-1",
+   "lesson": "01"
+  },
+  {
+   "q": "What does Gluon's <code>BlockedLayout(size_per_thread=[4], threads_per_warp=[32], warps_per_cta=[4], order=[0])</code> mean?",
+   "a": "Each thread owns 4 consecutive elements, 32 threads per warp, 4 warps per program: one layout tile covers 4·32·4 = 512 elements, repeated to fill BLOCK.",
+   "id": "01-2",
+   "lesson": "01"
+  },
+  {
+   "q": "State Little's law for memory bandwidth.",
+   "a": "Bytes in flight = bandwidth × latency. To reach peak HBM bandwidth you must keep about (TB/s × µs) bytes outstanding, which means many wide or independent loads per thread.",
+   "id": "01-3",
+   "lesson": "01"
+  },
+  {
+   "q": "Why does scalar CUDA add reach only about 4.1 TB/s while float4 reaches 7.2 TB/s?",
+   "a": "Each scalar thread keeps only 4 bytes per stream in flight. float4 issues 16-byte loads, four times more bytes outstanding per instruction, enough to cover HBM latency.",
+   "id": "01-4",
+   "lesson": "01"
+  },
+  {
+   "q": "Why is GB/s meaningless for a 2¹⁶-element add?",
+   "a": "The kernel finishes in about 6.6 µs, dominated by launch and synchronization overhead, and the data is L2-resident; you are measuring the launch floor.",
+   "id": "01-5",
+   "lesson": "01"
+  },
+  {
+   "q": "What happens if you drop the mask on the last Triton block?",
+   "a": "Out-of-bounds loads and stores: silent memory corruption or an illegal memory access error.",
+   "id": "01-6",
+   "lesson": "01"
+  },
+  {
+   "q": "What is kernel fusion, in terms of memory traffic?",
+   "a": "Combining several elementwise or reduction steps into one kernel so intermediates stay in registers or shared memory instead of making HBM round trips. Count bytes moved before and after.",
+   "id": "02-1",
+   "lesson": "02"
+  },
+  {
+   "q": "Why load masked lanes with <code>other=-inf</code> in softmax?",
+   "a": "So padded lanes never become the row max, and exp(-inf) = 0 keeps them out of the denominator.",
+   "id": "02-2",
+   "lesson": "02"
+  },
+  {
+   "q": "Why does the one-row-per-program softmax slow down at 65536 columns?",
+   "a": "The row no longer fits in registers; the compiler spills to local memory (which lives in HBM), adding traffic. Use an online (chunked) softmax instead.",
+   "id": "02-3",
+   "lesson": "02"
+  },
+  {
+   "q": "What is the online softmax?",
+   "a": "Process a row in chunks keeping running max m and sum s; when the max grows, rescale: s ← s·e^(m_old − m_new) + Σ e^(x − m_new). One pass, bounded registers; the core of flash attention.",
+   "id": "02-4",
+   "lesson": "02"
+  },
+  {
+   "q": "Why subtract the max before exp?",
+   "a": "To avoid overflow (exp overflows fp32 above about 88). The common factor e^(−max) cancels between numerator and denominator.",
+   "id": "02-5",
+   "lesson": "02"
+  },
+  {
+   "q": "Why save mean and rstd in LayerNorm's forward rather than the normalised output?",
+   "a": "They cost 8 bytes per row instead of D values per row; the backward recomputes x̂ = (x − mean)·rstd cheaply from x.",
+   "id": "03-1",
+   "lesson": "03"
+  },
+  {
+   "q": "How many activation-sized HBM transfers does LayerNorm-then-multiply take unfused vs fused?",
+   "a": "Unfused 5 (read x, write ℓ, read ℓ, read u, write y); fused 3 (read x, read u, write y).",
+   "id": "03-2",
+   "lesson": "03"
+  },
+  {
+   "q": "Give dx for LayerNorm in terms of g_x̂ = g·w.",
+   "a": "dx = rstd · (g_x̂ − mean(g_x̂) − x̂ · mean(g_x̂ · x̂)), means taken over the row.",
+   "id": "03-3",
+   "lesson": "03"
+  },
+  {
+   "q": "Why accumulate LayerNorm statistics in fp32 for bf16 inputs?",
+   "a": "bf16 has only 8 bits of mantissa; summing hundreds of values loses precision and the variance can even go negative from cancellation.",
+   "id": "03-4",
+   "lesson": "03"
+  },
+  {
+   "q": "The bf16 version reaches lower GB/s than fp32 at D=512. What would you change?",
+   "a": "Process several rows per program (2-D block) so each program moves more bytes and the fixed per-program reduction and launch costs amortise.",
+   "id": "03-5",
+   "lesson": "03"
+  },
+  {
+   "q": "Why does GEMM+SiLU fused beat cuBLAS GEMM followed by F.silu on the HSTU shape even though cuBLAS's GEMM is faster?",
+   "a": "The separate SiLU reads and writes the whole output (128 MiB each way at 65536×1024 bf16). On a skinny GEMM that traffic rivals the GEMM itself; fusing it into the epilogue removes it.",
+   "id": "04-1",
+   "lesson": "04"
+  },
+  {
+   "q": "What does TMA do?",
+   "a": "The Tensor Memory Accelerator copies a whole tile between global and shared memory asynchronously, from a descriptor (base, shape, strides, block shape) and a coordinate. No per-thread address arithmetic, hardware bounds handling.",
+   "id": "04-2",
+   "lesson": "04"
+  },
+  {
+   "q": "What is a persistent kernel?",
+   "a": "A grid of exactly one program per SM; each program loops over many output tiles. Removes wave-quantization tails and keeps pipelines warm across tiles.",
+   "id": "04-3",
+   "lesson": "04"
+  },
+  {
+   "q": "What does <code>warp_specialize=True</code> do in a Triton <code>tl.range</code> loop?",
+   "a": "Splits warps into producers (issue TMA loads) and consumers (issue MMAs), communicating through shared-memory barriers, so loads for the next tile overlap math on the current one.",
+   "id": "04-4",
+   "lesson": "04"
+  },
+  {
+   "q": "Why must the GEMM autotune key be bucketed for jagged training?",
+   "a": "The token count M changes every batch; keying on raw M re-runs autotuning (dozens of compile+bench runs) on every step. Key on next_power_of_2(M).",
+   "id": "04-5",
+   "lesson": "04"
+  },
+  {
+   "q": "What does grouped tile ordering buy?",
+   "a": "L2 reuse: GROUP consecutive programs share the same B column-tiles (and nearby A row-tiles) while those are still cached, cutting HBM reads.",
+   "id": "04-6",
+   "lesson": "04"
+  },
+  {
+   "q": "Why SiLU as <code>x / (1 + exp2(-x·log2 e))</code>?",
+   "a": "exp2 is a single MUFU instruction; it avoids a slower exp and a separate sigmoid then multiply.",
+   "id": "04-7",
+   "lesson": "04"
+  },
+  {
+   "q": "What does it mean for a warp's loads to be coalesced?",
+   "a": "The 32 lanes access contiguous (or at least the same few 32-byte sectors of) memory, so the hardware serves the warp with a handful of transactions instead of 32.",
+   "id": "05-1",
+   "lesson": "05"
+  },
+  {
+   "q": "Why is thread-per-row summation slow on a row-major matrix?",
+   "a": "At each step neighbouring threads read addresses a full row apart: every lane needs its own sector, wasting 7/8 of each 32-byte transaction.",
+   "id": "05-2",
+   "lesson": "05"
+  },
+  {
+   "q": "What does <code>__shfl_xor_sync(0xffffffff, v, off)</code> do?",
+   "a": "Each lane receives v from lane (laneId XOR off) in the same warp, register to register, no shared memory. Five rounds (16, 8, 4, 2, 1) give a full warp sum in every lane.",
+   "id": "05-3",
+   "lesson": "05"
+  },
+  {
+   "q": "Why does a shared-memory tree reduction leave performance on the table?",
+   "a": "log₂(blockDim) steps each separated by __syncthreads, with half the remaining threads idle at each step; plus a shared-memory round trip per step.",
+   "id": "05-4",
+   "lesson": "05"
+  },
+  {
+   "q": "How does <code>torch.cuda._compile_kernel</code> let you write CUDA without nvcc?",
+   "a": "It compiles a CUDA C++ source string at runtime with NVRTC and returns a launchable kernel: k(grid=..., block=..., args=[...], shared_mem=...).",
+   "id": "05-5",
+   "lesson": "05"
+  },
+  {
+   "q": "Why does the Triton rowsum keep a (BLOCK,) accumulator instead of summing each chunk to a scalar?",
+   "a": "Independent per-lane partial sums keep many adds and loads in flight (ILP) and defer the expensive cross-lane reduction to a single tl.sum at the end.",
+   "id": "05-6",
+   "lesson": "05"
+  },
+  {
+   "q": "Write the HSTU attention formula.",
+   "a": "A = SiLU(α·QKᵀ + rab) / N, causal (j ≤ i), output A·V; rab = w_pos[clamp(i−j)] + w_ts[floor(log2 max(|t_i − t_j|, 1))].",
+   "id": "06-1",
+   "lesson": "06"
+  },
+  {
+   "q": "What is a jagged batch?",
+   "a": "Variable-length sequences concatenated into one (T, …) tensor with an offsets array: user b owns rows offsets[b] … offsets[b+1]. No padding.",
+   "id": "06-2",
+   "lesson": "06"
+  },
+  {
+   "q": "How does the fused kernel avoid wasting work on short users?",
+   "a": "The grid covers max_len query blocks for every user; programs whose block starts at or after the user's length L return immediately.",
+   "id": "06-3",
+   "lesson": "06"
+  },
+  {
+   "q": "How do you compute floor(log2(x)) for positive fp32 x without calling log2?",
+   "a": "Reinterpret the bits as int32: ((bits &gt;&gt; 23) &amp; 0xFF) − 127, the unbiased exponent.",
+   "id": "06-4",
+   "lesson": "06"
+  },
+  {
+   "q": "Why is HSTU attention easier to fuse than softmax attention?",
+   "a": "Scores are pointwise (SiLU), with no row-wise normalisation, so there is no running max or sum to maintain and no rescaling; block contributions just add.",
+   "id": "06-5",
+   "lesson": "06"
+  },
+  {
+   "q": "Name the three sources of the fused kernel's speedup over dense PyTorch.",
+   "a": "No N×N tensors in HBM, no compute on padding, and skipping key blocks above the causal diagonal.",
+   "id": "06-6",
+   "lesson": "06"
+  },
+  {
+   "q": "Why compute the base address in int64?",
+   "a": "start·stride_t can exceed 2³¹ for large jagged batches (tokens × H × D), silently wrapping a 32-bit offset.",
+   "id": "06-7",
+   "lesson": "06"
+  },
+  {
+   "q": "Give the derivative of SiLU(s) in terms of σ = sigmoid(s).",
+   "a": "SiLU'(s) = σ·(1 + s·(1 − σ)).",
+   "id": "07-1",
+   "lesson": "07"
+  },
+  {
+   "q": "Why does the HSTU backward use two kernels?",
+   "a": "dK/dV reduce over queries and dQ reduces over keys. One kernel per reduction direction gives each output block a single owner, so no atomics on Q/K/V gradients (the FlashAttention-2 split).",
+   "id": "07-2",
+   "lesson": "07"
+  },
+  {
+   "q": "Why were atomic adds into one shared bias table about 70× slower than private rows?",
+   "a": "Thousands of programs hammered the same 288 addresses; same-address atomics serialise at their L2 slice. Private rows remove contention, then one cheap sum reduces them.",
+   "id": "07-3",
+   "lesson": "07"
+  },
+  {
+   "q": "What is \"recompute instead of store\" in attention backward?",
+   "a": "Do not save the N×N attention matrix; rebuild each score tile from Q, K and the bias inside the backward kernel. Costs FLOPs, saves O(N²) memory and traffic.",
+   "id": "07-4",
+   "lesson": "07"
+  },
+  {
+   "q": "Why add <code>reset_to_zero</code> to the autotuner of a kernel that accumulates with atomics?",
+   "a": "Autotuning runs the kernel many times on the same output buffer; without zeroing between trials, the accumulated values are wrong.",
+   "id": "07-5",
+   "lesson": "07"
+  },
+  {
+   "q": "Rule of thumb for atomics on GPUs?",
+   "a": "Cheap when addresses are spread out, catastrophic when they are hot. Reduce hierarchically: registers → private buffers → one final reduction.",
+   "id": "07-6",
+   "lesson": "07"
+  },
+  {
+   "q": "List the four stages of one HSTU layer and which lab's kernel implements each.",
+   "a": "SiLU(LN(x)·W_uvqk) (Lab 04 fused GEMM+SiLU) → jagged HSTU attention (Labs 06/07) → LayerNorm(a)·u (Lab 03) → residual + dropout + output projection (PyTorch).",
+   "id": "08-1",
+   "lesson": "08"
+  },
+  {
+   "q": "How do you check a model built on custom kernels is correct?",
+   "a": "Run the same weights through a plain-PyTorch implementation and compare forward outputs and every parameter's gradient (relative error), with a tolerance matched to the precision (about 1e-2 for bf16).",
+   "id": "08-2",
+   "lesson": "08"
+  },
+  {
+   "q": "Why does the fused model's peak memory stay flat as N grows, while dense grows quadratically?",
+   "a": "Nothing of size N×N is ever materialised: attention scores live in registers, and backward recomputes them.",
+   "id": "08-3",
+   "lesson": "08"
+  },
+  {
+   "q": "What does sampled softmax with shared negatives compute?",
+   "a": "For each position: logits = [⟨s, e_target⟩, ⟨s, e_neg1⟩ … ⟨s, e_negK⟩] / τ, cross-entropy with label 0. One random set of negatives is shared by the whole batch, so it is a single GEMM.",
+   "id": "08-4",
+   "lesson": "08"
+  },
+  {
+   "q": "Why recompute z = a·Wᵀ in MatmulSiLU's backward instead of saving it?",
+   "a": "z is a (T × 4·H·dh) activation per layer; one extra skinny GEMM is cheaper than that much memory, and memory is what limits batch size.",
+   "id": "08-5",
+   "lesson": "08"
+  },
+  {
+   "q": "Define HR@10 and NDCG@10.",
+   "a": "HR@10: fraction of users whose true next item ranks in the top 10. NDCG@10: average of 1/log₂(rank+1) when the item is in the top 10 (0 otherwise); it rewards higher ranks.",
+   "id": "09-1",
+   "lesson": "09"
+  },
+  {
+   "q": "What is the leave-one-out protocol for sequential recommendation?",
+   "a": "Hold out each user's last interaction as the test target, train on everything before it, and rank the target against the whole catalogue (full ranking, not sampled).",
+   "id": "09-2",
+   "lesson": "09"
+  },
+  {
+   "q": "Why did full softmax beat 512 sampled negatives on ML-1M?",
+   "a": "Sampled negatives give a noisy, biased estimate of the partition function (random negatives are mostly easy); with only 3,706 items the full softmax is one cheap GEMM.",
+   "id": "09-3",
+   "lesson": "09"
+  },
+  {
+   "q": "Why keep the training data pipeline on the GPU?",
+   "a": "Steps take about 8 ms; building jagged batches on the CPU and copying them would take longer than the step. GPU-side slicing keeps the GPU fed.",
+   "id": "09-4",
+   "lesson": "09"
+  },
+  {
+   "q": "Why did keying the GEMM autotuner on M make training hang?",
+   "a": "The token count M of a jagged batch changes every step, so every step triggered a full autotune (compiling and benchmarking every config).",
+   "id": "09-5",
+   "lesson": "09"
+  },
+  {
+   "q": "What does <code>allow_ragged_batch: true</code> enable in a Triton Inference Server config?",
+   "a": "The dynamic batcher may group requests whose inputs have different shapes (here, history lengths); the backend receives them as separate tensors and decides how to combine them.",
+   "id": "10-1",
+   "lesson": "10"
+  },
+  {
+   "q": "Why does HSTU serving batch without padding?",
+   "a": "execute() concatenates the ragged histories into one jagged tensor plus offsets, which is exactly the input format of the fused attention kernel.",
+   "id": "10-2",
+   "lesson": "10"
+  },
+  {
+   "q": "Why does throughput without batching saturate near 1 / (per-request latency)?",
+   "a": "One model instance processes one request at a time; each small forward is launch-bound, so extra concurrent clients only queue (p99 grows) without raising throughput.",
+   "id": "10-3",
+   "lesson": "10"
+  },
+  {
+   "q": "What trade-off does <code>max_queue_delay_microseconds</code> control?",
+   "a": "How long the scheduler waits to fill a batch: longer waits mean bigger batches and higher throughput under load, at the cost of added latency at low load.",
+   "id": "10-4",
+   "lesson": "10"
+  },
+  {
+   "q": "Why use DLPack rather than as_numpy() in the course's Python backend?",
+   "a": "The bundled backend stub is built against the numpy 1.x C ABI and misreads numpy 2 arrays (wrong element size → \"output tensor shape does not match\"); DLPack hands buffers across without numpy.",
+   "id": "10-5",
+   "lesson": "10"
+  },
+  {
+   "q": "Why can a served model's first requests be very slow?",
+   "a": "JIT compilation and autotuning of kernels for shapes not covered by warm-up; fix by warming every shape bucket and persisting compile/autotune caches.",
+   "id": "10-6",
+   "lesson": "10"
+  },
+  {
+   "q": "How do you tell whether a training step is launch-bound?",
+   "a": "Profile it: if summed GPU kernel time is far below wall time (low GPU-busy fraction) and the step has hundreds of small kernels, the CPU's launch rate is the limit.",
+   "id": "11-1",
+   "lesson": "11"
+  },
+  {
+   "q": "Name three cures for a launch-bound model.",
+   "a": "Bigger batches (more work per launch), CUDA graphs (one launch per captured sequence), and fusing small ops into fewer kernels (or torch.compile).",
+   "id": "11-2",
+   "lesson": "11"
+  },
+  {
+   "q": "How do you use CUDA graphs with jagged, variable-shape inputs?",
+   "a": "Capture one graph per (users, tokens) bucket with static buffers; copy each batch into the smallest bucket that fits, give unused users length 0, and let a dummy user absorb the unused token tail.",
+   "id": "11-3",
+   "lesson": "11"
+  },
+  {
+   "q": "Why must you run a Triton model once before capturing a CUDA graph?",
+   "a": "JIT compilation and autotuning (allocations, benchmarking, host syncs) cannot happen inside graph capture; they must be done before.",
+   "id": "11-4",
+   "lesson": "11"
+  },
+  {
+   "q": "What do TRITON_CACHE_DIR and TRITON_CACHE_AUTOTUNING=1 save?",
+   "a": "The cache dir stores compiled kernels (skip compilation); TRITON_CACHE_AUTOTUNING also stores the chosen autotune config (skip re-benchmarking): 17 s → 2.7 s to first step here.",
+   "id": "11-5",
+   "lesson": "11"
+  },
+  {
+   "q": "A profile shows <code>cutlass…simt_sgemm_f32…</code> near the top. What does that tell you?",
+   "a": "An fp32 GEMM is running on CUDA cores rather than tensor cores; switch it to bf16/TF32 or fuse it away (here: the loss logits).",
+   "id": "11-6",
+   "lesson": "11"
+  },
+  {
+   "q": "Why does an exact-match autotune cache miss after a trivial source edit in Helion, and what is the fix?",
+   "a": "The key includes a hash of the kernel source. The loose key uses specialisation (dtypes, shapes, strides), hardware and a structural config-space hash, then warm-starts the search from cached winners (FROM_BEST_AVAILABLE): 1238 s → 92 s.",
+   "id": "12-1",
+   "lesson": "12"
+  },
+  {
+   "q": "What does CompileIQ tune that Triton's autotuner does not?",
+   "a": "PTXAS's internal controls (register allocation, instruction scheduling, unrolling), searched evolutionarily and applied with ptx_options=\"--apply-controls=best.acf\": 5% geomean on B200.",
+   "id": "12-2",
+   "lesson": "12"
+  },
+  {
+   "q": "How do TritonPPM and Diode cut autotuning cost?",
+   "a": "Both predict runtime per config without running it (TritonPPM: static-analysis features + XGBoost; Diode: an MLP on shape/config features) and benchmark only the top-k.",
+   "id": "12-3",
+   "lesson": "12"
+  },
+  {
+   "q": "What problem does AOT-Tensor solve?",
+   "a": "JIT Triton needs Python and compile time at serving; AOT-T records specialisations and autotune picks in one forward pass, compiles cubins ahead of time into one .so per kernel with guards, for C++ serving.",
+   "id": "12-4",
+   "lesson": "12"
+  },
+  {
+   "q": "Why do non-power-of-two tiles (e.g. N=192) help on Hopper and Blackwell?",
+   "a": "Model shapes like head_dim 192 waste MMA work and shared memory when padded to 256; exact tiles let a 3-stage pipeline fit in 192 KB, where padded 256 needs 256 KB (over the limit).",
+   "id": "12-5",
+   "lesson": "12"
+  },
+  {
+   "q": "Which course lesson does vLLM's 8-byte-copy fix mirror?",
+   "a": "Lab 01: wider loads per thread put more bytes in flight (float4 vs scalar), turning a latency-bound copy into a bandwidth-bound one.",
+   "id": "12-6",
+   "lesson": "12"
+  },
+  {
+   "q": "What does <code>convert_layout(..., assert_trivial=True)</code> buy a Gluon programmer?",
+   "a": "A compile-time guarantee that the layout conversion moves no data (no shared-memory round trip); it errors otherwise.",
+   "id": "12-7",
+   "lesson": "12"
+  }
+ ]
+}
