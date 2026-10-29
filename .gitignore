@@ -4,3 +4,7 @@ data/
 checkpoints/
 logs/
 .triton_cache*/
+build/
+app/.build/
+app/.swiftpm/
+.DS_Store

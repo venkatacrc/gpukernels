@@ -1,84 +1,67 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0f1720">
-  <meta name="description" content="Hands-on course: GPU kernels in Triton, Gluon and CUDA, fused into an HSTU recommender, trained on MovieLens and served with Triton Inference Server.">
-  <title>GPU Kernels → HSTU</title>
-  <link rel="manifest" href="manifest.webmanifest">
-  <link rel="icon" href="icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="icon-192.png">
-  <link rel="stylesheet" href="style.css">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#4f8a00">
+    <meta name="description" content="Hands-on course: GPU kernels in Triton, Gluon and CUDA, fused into an HSTU recommender, trained on MovieLens and served with Triton Inference Server.">
+    <title>GPU Kernels → HSTU</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="icons/icon-192.png">
+    <link rel="apple-touch-icon" href="icons/icon-192.png">
+    <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <header class="toolbar">
-    <button id="menuBtn" class="icon-btn only-narrow" aria-label="Lessons">☰</button>
-    <div class="brand">GPU Kernels <span class="arrow">→</span> HSTU</div>
-    <nav class="tabs" role="tablist">
-      <button data-view="lessons" role="tab">Lessons</button>
-      <button data-view="cards" role="tab">Cards</button>
-      <button data-view="progress" role="tab">Progress</button>
-    </nav>
-    <div class="spacer"></div>
-    <div class="card-controls" hidden>
-      <div class="seg" id="cardMode">
-        <button data-mode="learn">Learn</button>
-        <button data-mode="test">Test</button>
-      </div>
-      <select id="cardFilter" aria-label="Which cards">
-        <option value="all">All cards</option>
-        <option value="unknown">Not yet known</option>
-        <option value="review">Review only</option>
-      </select>
-      <label class="check"><input type="checkbox" id="shuffle"> Shuffle</label>
-      <button id="restart" class="btn">Restart</button>
+    <div id="app">
+        <header class="topbar">
+            <button class="icon-btn" id="open-drawer" aria-label="Lessons and options">☰</button>
+            <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span> GPU Kernels <span class="arrow">→</span> HSTU</div>
+            <button class="icon-btn" id="open-print" aria-label="Print or save as PDF" title="Print / Save as PDF">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M6 14h12v7H6z"/>
+                </svg>
+            </button>
+        </header>
+        <div class="switches">
+            <div class="segmented" id="view-switch"></div>
+            <div class="segmented" id="mode-switch" hidden></div>
+        </div>
+        <div class="status" id="status"></div>
+        <div class="focus" id="focus" hidden></div>
+        <main id="stage"></main>
+        <nav class="actions" id="actions"></nav>
     </div>
-    <button id="printBtn" class="icon-btn" title="Print or save as PDF (⌘P)" aria-label="Print">⎙</button>
-    <div class="menu">
-      <button id="moreBtn" class="icon-btn" aria-label="More">⋮</button>
-      <div id="moreMenu" class="menu-pop" hidden>
-        <button id="exportBtn">Export progress…</button>
-        <button id="importBtn">Import progress…</button>
-        <button id="resetBtn">Reset progress…</button>
-        <hr>
-        <a href="https://github.com/venkatacrc/gpukernels" target="_blank" rel="noopener">Repository</a>
-        <button id="helpBtn">Keyboard shortcuts</button>
-      </div>
-      <input type="file" id="importFile" accept="application/json" hidden>
-    </div>
-  </header>
 
-  <div class="layout">
-    <aside id="sidebar" class="sidebar">
-      <div class="side-head">
-        <span>Lessons</span>
-        <span class="side-actions">
-          <button id="selAll" class="link">Select all</button> ·
-          <button id="selNone" class="link">Clear</button>
-        </span>
-      </div>
-      <ol id="lessonList" class="lesson-list"></ol>
-      <div class="side-foot" id="sideFoot"></div>
+    <div class="backdrop" id="backdrop" hidden></div>
+    <aside class="drawer" id="drawer" aria-hidden="true">
+        <div class="drawer-head">
+            <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span> GPU Kernels <span class="arrow">→</span> HSTU</div>
+            <button class="icon-btn" id="close-drawer" aria-label="Close">✕</button>
+        </div>
+        <div class="drawer-body" id="drawer-body"></div>
+        <div class="drawer-foot" id="drawer-foot"></div>
     </aside>
-    <main id="main" class="main" tabindex="-1"></main>
-  </div>
 
-  <div id="toast" class="toast" hidden></div>
+    <dialog id="help-dialog">
+        <div class="dialog-body">
+            <h2>Keyboard shortcuts</h2>
+            <p>On a phone, swipe the page or the card left or right.</p>
+            <table class="keys">
+                <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>Previous / next lesson or card</td></tr>
+                <tr><td><kbd>Space</kbd></td><td>Test: show the answer</td></tr>
+                <tr><td><kbd>G</kbd> / <kbd>M</kbd></td><td>Test: got it / missed it</td></tr>
+                <tr><td><kbd>K</kbd> / <kbd>R</kbd></td><td>Mark the card known / for review</td></tr>
+                <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Lessons / Cards / Progress</td></tr>
+                <tr><td><kbd>⌘P</kbd></td><td>Print this lesson, or the selected lessons from Cards and Progress</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Close the drawer</td></tr>
+            </table>
+        </div>
+        <form method="dialog" class="dialog-actions"><button class="btn primary">Close</button></form>
+    </dialog>
+    <input type="file" id="import-file" accept="application/json" hidden>
+    <div class="toast" id="toast" hidden></div>
+    <section id="print-area" aria-hidden="true"></section>
 
-  <dialog id="helpDlg">
-    <h3>Keyboard shortcuts</h3>
-    <table>
-      <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>previous / next lesson or card</td></tr>
-      <tr><td><kbd>Space</kbd></td><td>Test: show the answer</td></tr>
-      <tr><td><kbd>G</kbd> / <kbd>M</kbd></td><td>Test: got it / missed it</td></tr>
-      <tr><td><kbd>K</kbd> / <kbd>R</kbd></td><td>mark card known / for review</td></tr>
-      <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></td><td>Lessons / Cards / Progress</td></tr>
-      <tr><td><kbd>⌘P</kbd></td><td>print the current lesson or the selected lessons</td></tr>
-    </table>
-    <form method="dialog"><button class="btn">Close</button></form>
-  </dialog>
-
-  <script src="app.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>

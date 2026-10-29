@@ -2,7 +2,7 @@
 
 Write GPU kernels in **Triton**, **Gluon** and **CUDA**, one at a time, and stitch them into an **HSTU** generative recommender in PyTorch. Then train it on MovieLens and serve it with **Triton Inference Server**. In every lab you write the code, run it, measure the result on your GPU, and only then read why it behaves that way.
 
-The lessons live in a small offline web app (`web/`): Lessons, flash Cards (Learn and Test modes), and Progress. Progress is stored in your browser.
+The lessons live in a small offline web app (`web/`, live at [venkatacrc.github.io/gpukernels](https://venkatacrc.github.io/gpukernels/)) and a native Mac app (`app/`): Lessons, flash Cards (Learn and Test modes), and Progress. Progress is stored on your device and can be exported from one app and imported into the other.
 
 ## Syllabus
 
@@ -53,6 +53,17 @@ node tools/smoke_web.js                         # headless render check
 
 Lessons are Markdown in `course/` with `::: write`, `::: run`, `::: measure`, `::: explain`, `::: cards` and `::: note` blocks (format documented at the top of `tools/build_course.py`). The explanation of each lab unlocks after you record your measurements, and the app compares each one with the reference.
 
-Keyboard: `1`/`2`/`3` switch views; `←`/`→` previous/next lesson or card; in Cards, `Space` reveals, `G`/`M` got it / missed it, `K`/`R` mark known / review; `Ctrl+P` prints the selected lessons. Cards swipe on phones. The app is installable and works offline.
+The layout is a single phone-width column: the ☰ menu opens a drawer with the lesson list (tick lessons to choose which cards you practise and what prints), card options (filter, shuffle, restart) and Export / Import / Print / Reset. The buttons at the bottom move between lessons or cards; *Practise N cards* drills just the open lesson.
+
+Keyboard: `1`/`2`/`3` switch views; `←`/`→` previous/next lesson or card; in Cards, `Space` reveals, `G`/`M` got it / missed it, `K`/`R` mark known / review; `Ctrl+P` (`⌘P`) prints the open lesson, or the selected lessons from Cards and Progress. Cards swipe on phones. The app is installable and works offline.
+
+## The Mac app
+
+```bash
+./scripts/build_app.sh                          # needs Xcode or the Command Line Tools (macOS 14+)
+open build/GPUKernels.app
+```
+
+The same course in a native window: the sidebar lists the lessons with progress rings and checkboxes for selection, the toolbar switches Lessons / Cards / Progress, and lessons render with the same highlighting and measurement checks as the web app. Shortcuts: `⌘1`–`⌘3` views, `⌘[` / `⌘]` previous / next lesson, `⌘L` practise this lesson's cards, `⌘P` print or save the lesson as PDF, `⌘⇧P` print the selected lessons, `⌘⇧E` / `⌘⇧I` export / import progress. In Cards, `←`/`→`, `Space`, `G`/`M` and `K`/`R` work as on the web. Progress is saved to `~/Library/Application Support/GPUKernels/progress.json`, in the same format as the web app's export.
 
 GitHub Pages: `.github/workflows/pages.yml` rebuilds `course.json` and publishes `web/` on every push to `main`. Enable it under Settings → Pages → Source: GitHub Actions.

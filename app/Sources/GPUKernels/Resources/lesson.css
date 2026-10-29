@@ -1,0 +1,114 @@
+/* Lesson pages in the Mac app; the lesson part of web/app.css. */
+:root {
+    --accent: #4f8a00;
+    --accent-light: #76b900;
+    --text: #18201a;
+    --muted: #66705f;
+    --line: #dfe4da;
+    --soft: #f3f5f0;
+    --card: #ffffff;
+    --green: #2e9e5b;
+    --orange: #d9791f;
+    --red: #c9372c;
+    --code-bg: #0f1720;
+    --code-ink: #e6edf3;
+    --write: #fff6e3;
+    --run: #eaf2ff;
+    --measure: #eef8e6;
+    --explain: #f4eeff;
+    color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --accent: #8fd11a;
+        --accent-light: #a6e22e;
+        --text: #e8eee6;
+        --muted: #9aa696;
+        --line: #2b342d;
+        --soft: #202721;
+        --card: #171d19;
+        --code-bg: #0a0e0c;
+        --write: #2a2312;
+        --run: #13223a;
+        --measure: #16261a;
+        --explain: #221a33;
+    }
+}
+
+html, body { margin: 0; background: transparent; color: var(--text); }
+body { font: 15px/1.6 -apple-system, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+.lesson { max-width: 820px; margin: 0 auto; padding: 26px 30px 40px; }
+a { color: var(--accent); }
+
+.kicker { margin: 0 0 6px; font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--accent); }
+h1 { margin: 0 0 6px; font-size: 28px; line-height: 1.2; }
+.meta { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+.meta code { color: var(--text); }
+.lead { margin: 0 0 8px; font-size: 16px; line-height: 1.5; }
+h3 { margin: 1.3em 0 0.3em; font-size: 17px; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 0.25em 0; }
+blockquote { margin: 12px 0; padding: 4px 0 4px 14px; border-left: 3px solid var(--accent); color: var(--muted); }
+
+code { font: 0.88em ui-monospace, SFMono-Regular, Menlo, monospace; }
+:not(pre) > code { background: color-mix(in srgb, var(--text) 8%, transparent); padding: 0.1em 0.35em; border-radius: 5px; }
+pre { position: relative; margin: 1em 0; padding: 14px 16px; border-radius: 12px; background: var(--code-bg); color: var(--code-ink);
+      overflow-x: auto; line-height: 1.45; font-size: 13px; }
+pre .copy { position: absolute; top: 6px; right: 6px; padding: 2px 9px; border: 1px solid #3a4655; border-radius: 7px;
+            background: #1d2733; color: #c9d3dd; font: 12px -apple-system, system-ui, sans-serif; cursor: pointer; }
+.tok-k { color: #ff7b72; }
+.tok-s { color: #a5d6ff; }
+.tok-c { color: #8b949e; font-style: italic; }
+.tok-n { color: #79c0ff; }
+.tok-f { color: #d2a8ff; }
+
+table { border-collapse: collapse; margin: 12px 0; font-size: 14px; display: block; overflow-x: auto; }
+th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; vertical-align: top; }
+th { background: var(--soft); }
+
+.math { font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-style: italic; white-space: nowrap; }
+.math .mr { font-style: normal; }
+.math .ovl { text-decoration: overline; }
+.math sup, .math sub { font-size: 0.72em; }
+
+.step { margin: 20px 0; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.step > header { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.step .badge { padding: 2px 9px; border-radius: 99px; border: 1px solid var(--line); background: var(--card);
+               font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase; }
+.step .done { display: flex; align-items: center; gap: 6px; margin-left: auto; font-weight: 500; font-size: 14px; }
+.step .done input { width: 16px; height: 16px; accent-color: var(--accent); }
+.step > .body { padding: 2px 16px 12px; }
+.step.write > header { background: var(--write); }
+.step.run > header { background: var(--run); }
+.step.measure > header { background: var(--measure); }
+.step.explain > header { background: var(--explain); }
+.step.note { border-style: dashed; }
+.step.is-done > header .badge { border-color: var(--accent); background: var(--accent); color: var(--card); }
+
+.measure-field { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.measure-field:last-child { border-bottom: none; }
+.measure-field label { font-weight: 500; }
+.measure-field .mval { display: flex; align-items: center; gap: 6px; }
+.measure-field input { width: 8em; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--soft);
+                       color: var(--text); font: inherit; text-align: right; }
+.measure-field .unit { min-width: 3.4em; color: var(--muted); font-size: 13px; }
+.measure-field .cmp-line { grid-column: 1 / -1; font-size: 13px; }
+.measure-field .cmp-line:empty { display: none; }
+.cmp.good { color: var(--green); }
+.cmp.warn { color: var(--orange); }
+.cmp.bad { color: var(--red); }
+
+.locked { padding: 16px 4px 6px; color: var(--muted); text-align: center; }
+.btn { margin-top: 10px; padding: 6px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--text);
+       font: 500 14px -apple-system, system-ui, sans-serif; cursor: pointer; }
+
+@media print {
+    :root { --text: #000; --muted: #444; --soft: #f3f3f3; --card: #fff; --code-bg: #f6f6f6; --code-ink: #000;
+            --write: #fff; --run: #fff; --measure: #fff; --explain: #fff; }
+    .lesson { max-width: none; padding: 0; }
+    .print-lesson { break-after: page; }
+    .step { break-inside: avoid; border-color: #bbb; }
+    pre { white-space: pre-wrap; border: 1px solid #ddd; }
+    .tok-k, .tok-s, .tok-c, .tok-n, .tok-f { color: #000; }
+}
